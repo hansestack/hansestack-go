@@ -6,6 +6,9 @@
 Official Go client library for the [Hansestack](https://hansestack.de) API.
 No third-party dependencies — standard library only.
 
+> **Using an AI coding agent?** Point it at [`llms.txt`](./llms.txt) for
+> machine-readable integration rules.
+
 ## Installation
 
 ```sh
@@ -122,6 +125,17 @@ Log levels encode who has to act:
 
 A successful check logs nothing. Clients are safe for concurrent use; create
 one and reuse it so connections are pooled.
+
+## For AI coding agents
+
+[`llms.txt`](./llms.txt) is a machine-readable integration guide for AI agents
+(Copilot, Cursor, Claude) wiring this library into a Go backend. It documents
+the exact API surface, the fail-open prime directive, a canonical HTTP handler
+pattern, and the anti-patterns to avoid — most importantly, never returning a
+5xx to a user because a leak check failed.
+
+It is written for agents *integrating* the library, not for agents modifying
+this repository.
 
 ## Development
 

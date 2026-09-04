@@ -1,0 +1,338 @@
+# hansestack-go / leakcheck
+
+> Official Go client for the Hansestack Leak-Check API. Checks whether a
+> password appears in a known data-breach corpus using k-anonymity: the
+> password never leaves the calling process. Standard library only, no
+> third-party dependencies.
+
+## AGENT DIRECTIVE
+
+If you are an AI tasked with modifying the source code of hansestack-go itself,
+ignore this file. This file is strictly for AIs tasked with INTEGRATING
+hansestack-go into other applications.
+
+Scope of this document: wiring `leakcheck` into a third-party Go backend —
+login handlers, sign-up flows, password-change endpoints, authentication
+middleware.
+
+Do not invent symbols. The complete public API is listed under `## API`.
+Nothing else is exported. In particular there is no result struct, no
+`CheckResult` type, and no `Check`, `Verify` or `IsLeaked` method.
+
+## PRIME DIRECTIVE: FAIL OPEN
+
+Hansestack is an ADDITIONAL security layer, never a single point of failure.
+A leak check that cannot complete must never prevent a user from logging in,
+signing up, or changing a password.
+
+RULE 1 — Never map a leak-check failure to a user-facing error.
+  NEVER generate `http.Error(w, ..., http.StatusInternalServerError)` because
+  `CheckPassword` failed. NEVER return 500, 502, 503 or 504 to the end user on
+  account of this library. The user's flow must continue unchanged.
+
+RULE 2 — Never add `WithFailClose()` to an interactive authentication flow.
+  The default is fail-open and is the correct choice for login, sign-up and
+  password-change. Only use `WithFailClose()` in batch jobs, CI checks, admin
+  tooling or tests, where a silently skipped check is worse than a hard stop.
+
+RULE 3 — In the default configuration, `err` is ALWAYS `nil`.
+  This is the single most misunderstood part of this API. The client already
+  catches network errors, timeouts, 429 and 5xx internally, logs them, and
+  returns `(false, 0, nil)`. A non-nil error is only reachable if someone
+  opted into `WithFailClose()`.
+
+RULE 4 — Handle `err` defensively anyway, and treat it as "safe, proceed".
+  The signature permits a non-nil error, and the client you are wiring into
+  may have been constructed elsewhere with `WithFailClose()`. On error: log it
+  and continue as if the password were not leaked. Never branch to a 5xx.
+
+RULE 5 — Never add retries, sleeps, backoff or caching around this call.
+  The client makes exactly one attempt bounded by a 500ms timeout and never
+  retries, including on 429. On 429 it does not sleep. Adding your own retry
+  loop puts rate-limit latency directly onto an end user's login request.
+
+RULE 6 — Only `leaked == true` may block a user, and only with a 4xx.
+  A confirmed leak is a client-side validation failure. Use HTTP 400 or 422
+  with an actionable message, exactly as you would for a weak password.
+
+## INSTALL
+
+```sh
+go get github.com/hansestack/hansestack-go
+```
+
+```go
+import "github.com/hansestack/hansestack-go/leakcheck"
+```
+
+Module path: `github.com/hansestack/hansestack-go`
+Package path: `github.com/hansestack/hansestack-go/leakcheck`
+Package name: `leakcheck`
+Requires: Go 1.26+. No third-party dependencies.
+
+## API
+
+This is the complete exported surface. Nothing else exists.
+
+```go
+// Constructor.
+func NewClient(apiKey string, opts ...Option) *Client
+
+// The only method. Returns (leaked, breachCount, err).
+func (c *Client) CheckPassword(ctx context.Context, password string) (bool, int, error)
+
+// Options.
+type Option func(*Client)
+func WithTimeout(d time.Duration) Option // default: DefaultTimeout (500ms); non-positive ignored
+func WithLogger(l *slog.Logger) Option   // default: discard logger; nil ignored
+func WithFailClose() Option              // default: fail open. Do not use in auth flows.
+
+// Constant.
+const DefaultTimeout = 500 * time.Millisecond
+```
+
+Return values of `CheckPassword`:
+
+- `leaked bool` — true if the password was found in the breach corpus.
+- `count int` — number of times it was seen. Meaningful only when `leaked`
+  is true. May legitimately be `0` even when `leaked` is true.
+- `err error` — always `nil` unless the client was built with
+  `WithFailClose()`. A non-nil error always accompanies `(false, 0)`, so
+  treating an error as "not leaked" is always correct.
+
+Error sentinels, for `errors.Is`. Only reachable under `WithFailClose()`:
+
+```go
+leakcheck.ErrUnauthorized     // 401/403 — bad or missing API key. Broken integration.
+leakcheck.ErrBadRequest       // other 4xx — malformed request. Broken integration.
+leakcheck.ErrRateLimited      // 429 — quota exceeded. Transient.
+leakcheck.ErrServerError      // 5xx — upstream fault. Transient.
+leakcheck.ErrUnexpectedStatus // status outside the API contract.
+leakcheck.ErrInvalidResponse  // unreadable or malformed response body.
+leakcheck.ErrRequestFailed    // no response: DNS, connection refused, TLS, timeout.
+```
+
+## INITIALIZE
+
+Construct the client ONCE at application startup and reuse it. It is safe for
+concurrent use by multiple goroutines and pools HTTP connections, which matters
+on an authentication hot path. Never construct one per request.
+
+Store it on your server/service struct or inject it as a dependency.
+
+```go
+type Server struct {
+	leaks *leakcheck.Client
+}
+
+func NewServer(logger *slog.Logger) *Server {
+	return &Server{
+		// Defaults are production-correct: 500ms timeout, fail-open,
+		// silent logger. Pass a logger to get visibility into failures.
+		leaks: leakcheck.NewClient(
+			os.Getenv("HANSESTACK_API_KEY"),
+			leakcheck.WithLogger(logger),
+		),
+	}
+}
+```
+
+With an explicit timeout override:
+
+```go
+client := leakcheck.NewClient(apiKey,
+	leakcheck.WithTimeout(300*time.Millisecond),
+	leakcheck.WithLogger(logger),
+)
+```
+
+An empty API key does not panic or fail construction. It surfaces as a 401,
+is logged at ERROR level, and under the default policy is reported as
+"not leaked" — so a misconfigured deployment degrades instead of breaking.
+
+## INTEGRATION PATTERN
+
+Canonical sign-up / password-change handler. Copy this shape.
+
+```go
+func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	// Always pass the request context so the check inherits cancellation.
+	leaked, count, err := s.leaks.CheckPassword(r.Context(), req.Password)
+	if err != nil {
+		// FAIL OPEN. Log and continue as if the password were safe.
+		// Never return 5xx here. With the default client this branch is
+		// unreachable, but handling it keeps the code correct either way.
+		slog.WarnContext(r.Context(), "leak check unavailable, continuing",
+			"error", err)
+	}
+
+	if leaked {
+		// A confirmed leak is a validation failure: 4xx, not 5xx.
+		http.Error(w,
+			fmt.Sprintf("this password appeared in %d known data breaches, please choose another", count),
+			http.StatusBadRequest)
+		return
+	}
+
+	// Proceed with the normal flow: hash the password, create the user.
+	if err := s.createUser(r.Context(), req.Email, req.Password); err != nil {
+		http.Error(w, "could not create account", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusCreated)
+}
+```
+
+Note the two distinct 500s in that handler: `createUser` failing is a genuine
+server error and returns 500. The leak check failing is not, and never does.
+
+## ANTI-PATTERNS
+
+WRONG — returning 5xx because the check failed. This is the failure this
+library exists to prevent: an outage at Hansestack locks every user out.
+
+```go
+leaked, _, err := client.CheckPassword(ctx, pw)
+if err != nil {
+	http.Error(w, "internal server error", http.StatusInternalServerError) // NO
+	return
+}
+```
+
+RIGHT — log and continue.
+
+```go
+leaked, _, err := client.CheckPassword(ctx, pw)
+if err != nil {
+	logger.Warn("leak check unavailable, continuing", "error", err)
+}
+```
+
+WRONG — fail-close in an interactive auth flow.
+
+```go
+client := leakcheck.NewClient(key, leakcheck.WithFailClose()) // NO, not for login
+```
+
+RIGHT — defaults.
+
+```go
+client := leakcheck.NewClient(key, leakcheck.WithLogger(logger))
+```
+
+WRONG — discarding the request context.
+
+```go
+client.CheckPassword(context.Background(), pw) // NO, ignores client disconnect
+```
+
+RIGHT — inherit cancellation from the request.
+
+```go
+client.CheckPassword(r.Context(), pw)
+```
+
+WRONG — a client per request. Defeats connection pooling on the hot path.
+
+```go
+func handler(w http.ResponseWriter, r *http.Request) {
+	client := leakcheck.NewClient(os.Getenv("HANSESTACK_API_KEY")) // NO
+}
+```
+
+RIGHT — construct once at startup, reuse everywhere.
+
+WRONG — retry or back off around the call.
+
+```go
+for i := 0; i < 3; i++ { // NO. Never retry; the client is single-attempt by design.
+	leaked, _, err = client.CheckPassword(ctx, pw)
+	if err == nil {
+		break
+	}
+	time.Sleep(time.Second) // NO. Never sleep in an auth path.
+}
+```
+
+WRONG — hashing or obfuscating the password before passing it in. The library
+does this itself; pre-hashing produces a wrong lookup.
+
+```go
+sum := sha1.Sum([]byte(pw))
+client.CheckPassword(ctx, hex.EncodeToString(sum[:])) // NO, pass the plaintext
+```
+
+RIGHT — pass the plaintext password. It never leaves the process.
+
+## PRIVACY (k-ANONYMITY)
+
+The plaintext password never leaves the calling process, and neither does its
+full hash.
+
+1. The library computes SHA-1 over the password locally.
+2. It sends ONLY the first 5 characters of the uppercase hex digest.
+3. The server returns all known suffixes sharing that prefix.
+4. The final comparison happens locally, in memory.
+
+The server learns only that some password beginning with a given 5-character
+hash prefix was checked — a set spanning a very large number of candidates. It
+cannot determine which password, nor whether there was a match.
+
+Consequences for you as the integrating agent:
+
+- Do NOT add your own hashing, encryption or obfuscation before the call.
+- Do NOT add a consent gate, privacy banner or opt-in for this check. No
+  personal data is transmitted.
+- It is safe to call before the user record exists.
+- It is safe to call on every sign-up, login and password change.
+- Do NOT log the password, the digest, or the prefix in your own code. The
+  library never logs any of them.
+
+SHA-1 is a wire-format requirement of the k-anonymity protocol and the upstream
+breach corpus. It is not used as a security control. Do not "upgrade" it.
+
+## BEHAVIOUR
+
+Default client (fail-open). `err` is always nil; the library logs internally.
+
+| Condition            | Returns          | Library logs | Your action                    |
+| -------------------- | ---------------- | ------------ | ------------------------------ |
+| Password found       | `(true, N, nil)` | —            | Reject with 400/422             |
+| Password not found   | `(false, 0, nil)`| —            | Continue                        |
+| Timeout (>500ms)     | `(false, 0, nil)`| WARN         | Continue                        |
+| Network/DNS/TLS fail | `(false, 0, nil)`| WARN         | Continue                        |
+| 429 rate limited     | `(false, 0, nil)`| WARN         | Continue. Never sleep or retry. |
+| 5xx upstream fault   | `(false, 0, nil)`| WARN         | Continue                        |
+| 401/403 bad API key  | `(false, 0, nil)`| ERROR        | Continue. Alert operators.      |
+| 4xx malformed        | `(false, 0, nil)`| ERROR        | Continue. Alert operators.      |
+
+With `WithFailClose()` the same conditions return `(false, 0, err)` wrapping
+the matching sentinel. The boolean and integer results are identical in both
+modes; only error propagation differs.
+
+Timing: one attempt, hard-bounded at 500ms by default. A shorter deadline on
+the context you pass wins. Worst-case added latency to your handler is the
+configured timeout.
+
+## WHEN FAIL-CLOSE IS APPROPRIATE
+
+Use `WithFailClose()` only where a silently skipped check is worse than a hard
+failure, and no end user is waiting:
+
+- Batch auditing of stored credentials.
+- CI pipelines and pre-deployment checks.
+- Internal admin tooling.
+- Tests asserting the check actually ran.
+
+Never in: login, sign-up, password reset, password change, or any request
+serving an interactive user.
