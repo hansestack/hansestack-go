@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # A library is compiled by consumers on toolchains we do not control,
+        # so verify the go.mod baseline as well as the current stable release.
+        go-version: [ '1.26.x', 'stable' ]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go-version }}
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+      - name: Vulnerability Check
+        id: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: ${{ matrix.go-version }}
+          work-dir: .
+
+      - name: Test
+        run: make test

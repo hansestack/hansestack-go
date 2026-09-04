@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Update Go modules and Go version in go.mod
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    
+    # Group all Go module updates into a single Pull Request
+    groups:
+      go-dependencies:
+        patterns:
+          - "*" # Matches all dependencies for grouping
+          
+    labels:
+      - "dependencies"
+      - "go"
+
+  # Keep GitHub Actions updated
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      
+    # Group all GitHub Action updates into a single Pull Request
+    groups:
+      action-updates:
+        patterns:
+          - "*" # Matches all action updates for grouping
+          
+    labels:
+      - "dependencies"
+      - "actions"
