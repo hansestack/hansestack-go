@@ -94,6 +94,23 @@ client := leakcheck.NewClient(apiKey,
 | `WithTimeout(d)` | `500ms` | Per-request timeout. Non-positive values are ignored. |
 | `WithLogger(l)` | discard | `*slog.Logger` for internal diagnostics. `nil` is ignored. |
 | `WithFailClose()` | fail open | Return errors to the caller instead of swallowing them. |
+| `WithHTTPClient(hc)` | internal client | Carry requests through your own `*http.Client`, e.g. to add a circuit breaker, metrics or tracing in a `RoundTripper`. `nil` is ignored. The context deadline still bounds every call. |
+
+### Bringing your own HTTP client
+
+`WithHTTPClient` swaps the transport, not the contract. Put anything that
+satisfies `http.RoundTripper` in front of the call — metrics, tracing, or a
+circuit breaker from a library you already run:
+
+```go
+hc := &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)}
+
+client := leakcheck.NewClient(apiKey, leakcheck.WithHTTPClient(hc))
+```
+
+The supplied client needs no `Timeout` of its own: the client timeout is
+applied as a context deadline on every call, so the fail-open guarantee holds
+either way, and the earlier of the two deadlines wins.
 
 With `WithFailClose`, failures are returned as errors wrapping package
 sentinels — match them with `errors.Is`:

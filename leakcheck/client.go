@@ -167,8 +167,12 @@ func NewClient(apiKey string, opts ...Option) *Client {
 
 	// Constructed after options are applied so the timeout reflects
 	// WithTimeout. Set explicitly rather than relying on any library default,
-	// which for http.Client is no timeout at all.
-	c.httpClient = &http.Client{Timeout: c.timeout}
+	// which for http.Client is no timeout at all. A client supplied through
+	// WithHTTPClient is kept as-is; the context deadline in CheckPassword
+	// bounds it either way.
+	if c.httpClient == nil {
+		c.httpClient = &http.Client{Timeout: c.timeout}
+	}
 
 	return c
 }
