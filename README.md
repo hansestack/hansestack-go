@@ -40,14 +40,14 @@ import (
 func main() {
 	client := leakcheck.NewClient(os.Getenv("HANSESTACK_API_KEY"))
 
-	leaked, count, err := client.CheckPassword(context.Background(), "hunter2")
+	res, err := client.CheckPassword(context.Background(), "hunter2")
 	if err != nil {
 		// Unreachable with the default fail-open policy.
 		panic(err)
 	}
 
-	if leaked {
-		fmt.Printf("password found in %d known breaches\n", count)
+	if res.Leaked {
+		fmt.Printf("password found in %d known breaches\n", res.Count)
 	} else {
 		fmt.Println("password not found in any known breach")
 	}
@@ -112,11 +112,40 @@ The supplied client needs no `Timeout` of its own: the client timeout is
 applied as a context deadline on every call, so the fail-open guarantee holds
 either way, and the earlier of the two deadlines wins.
 
+### Telling a skipped check from a clean miss
+
+Under fail-open, a password that is not in the corpus and a check that never
+ran are both reported as "not leaked". `Result.Outcome` keeps them apart, so a
+skip can be counted, alerted on, or fed into a risk decision without changing
+the fail-open policy:
+
+```go
+res, _ := client.CheckPassword(ctx, password)
+
+leakChecks.WithLabelValues(res.Outcome.String()).Inc()
+
+switch {
+case res.Leaked:
+    requirePasswordChange()
+case !res.Outcome.Checked() && suspiciousLogin(r):
+    // The control did not run and the login already looks unusual.
+    requireStepUp()
+}
+```
+
+| Outcome | `Checked()` | Meaning |
+| --- | --- | --- |
+| `OutcomeChecked` | `true` | The API answered; `Leaked` is authoritative. |
+| `OutcomeSkippedTimeout` | `false` | The deadline expired before an answer arrived. |
+| `OutcomeSkippedRateLimited` | `false` | The API answered `429`. |
+| `OutcomeSkippedError` | `false` | Connection error, upstream `5xx`, unreadable body, or misconfiguration. |
+| `OutcomeSkippedCanceled` | `false` | The caller's context was cancelled — a user who navigated away. Kept apart from a timeout so a rise in `skipped_timeout` still means the API got slow. |
+
 With `WithFailClose`, failures are returned as errors wrapping package
 sentinels — match them with `errors.Is`:
 
 ```go
-leaked, count, err := client.CheckPassword(ctx, password)
+res, err := client.CheckPassword(ctx, password)
 switch {
 case errors.Is(err, leakcheck.ErrUnauthorized):
 	// Broken integration: bad or missing API key.

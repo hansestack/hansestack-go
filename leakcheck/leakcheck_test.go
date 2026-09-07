@@ -223,7 +223,8 @@ func TestCheckPasswordStatuses(t *testing.T) {
 			t.Run("fail-open", func(t *testing.T) {
 				client := newTestClient(t, tc.handler)
 
-				found, count, err := client.CheckPassword(context.Background(), pwPassword)
+				res, err := client.CheckPassword(context.Background(), pwPassword)
+				found, count := res.Leaked, res.Count
 				if err != nil {
 					t.Fatalf("fail-open returned error %v, want nil", err)
 				}
@@ -238,7 +239,8 @@ func TestCheckPasswordStatuses(t *testing.T) {
 			t.Run("fail-close", func(t *testing.T) {
 				client := newTestClient(t, tc.handler, WithFailClose())
 
-				found, count, err := client.CheckPassword(context.Background(), pwPassword)
+				res, err := client.CheckPassword(context.Background(), pwPassword)
+				found, count := res.Leaked, res.Count
 
 				if tc.wantErr == nil {
 					if err != nil {
@@ -280,7 +282,7 @@ func TestRequestShape(t *testing.T) {
 		_, _ = w.Write([]byte(`{}`))
 	})
 
-	if _, _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+	if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
@@ -354,7 +356,7 @@ func TestPrefixIsDerivedPerPassword(t *testing.T) {
 	})
 
 	for _, pw := range []string{pwPassword, pwHunter2, ""} {
-		if _, _, err := client.CheckPassword(context.Background(), pw); err != nil {
+		if _, err := client.CheckPassword(context.Background(), pw); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
@@ -393,7 +395,8 @@ func TestTimeout(t *testing.T) {
 		client := newTestClient(t, slow, WithTimeout(50*time.Millisecond))
 
 		start := time.Now()
-		found, count, err := client.CheckPassword(context.Background(), pwPassword)
+		res, err := client.CheckPassword(context.Background(), pwPassword)
+		found, count := res.Leaked, res.Count
 		elapsed := time.Since(start)
 
 		if err != nil {
@@ -410,7 +413,7 @@ func TestTimeout(t *testing.T) {
 	t.Run("fail-close reports the deadline", func(t *testing.T) {
 		client := newTestClient(t, slow, WithTimeout(50*time.Millisecond), WithFailClose())
 
-		_, _, err := client.CheckPassword(context.Background(), pwPassword)
+		_, err := client.CheckPassword(context.Background(), pwPassword)
 
 		if !errors.Is(err, ErrRequestFailed) {
 			t.Fatalf("error = %v, want errors.Is(_, ErrRequestFailed)", err)
@@ -440,7 +443,7 @@ func TestCallerDeadlineWins(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	_, _, err := client.CheckPassword(ctx, pwPassword)
+	_, err := client.CheckPassword(ctx, pwPassword)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
@@ -460,7 +463,8 @@ func TestNetworkError(t *testing.T) {
 	t.Run("fail-open", func(t *testing.T) {
 		client := NewClient("k", withBaseURL(deadURL))
 
-		found, count, err := client.CheckPassword(context.Background(), pwPassword)
+		res, err := client.CheckPassword(context.Background(), pwPassword)
+		found, count := res.Leaked, res.Count
 		if err != nil {
 			t.Fatalf("fail-open returned error %v, want nil", err)
 		}
@@ -472,7 +476,7 @@ func TestNetworkError(t *testing.T) {
 	t.Run("fail-close", func(t *testing.T) {
 		client := NewClient("k", withBaseURL(deadURL), WithFailClose())
 
-		if _, _, err := client.CheckPassword(context.Background(), pwPassword); !errors.Is(err, ErrRequestFailed) {
+		if _, err := client.CheckPassword(context.Background(), pwPassword); !errors.Is(err, ErrRequestFailed) {
 			t.Fatalf("error = %v, want errors.Is(_, ErrRequestFailed)", err)
 		}
 	})
@@ -489,7 +493,8 @@ func TestCanceledContext(t *testing.T) {
 	t.Run("fail-open", func(t *testing.T) {
 		client := newTestClient(t, handler)
 
-		found, count, err := client.CheckPassword(ctx, pwPassword)
+		res, err := client.CheckPassword(ctx, pwPassword)
+		found, count := res.Leaked, res.Count
 		if err != nil {
 			t.Fatalf("fail-open returned error %v, want nil", err)
 		}
@@ -501,7 +506,7 @@ func TestCanceledContext(t *testing.T) {
 	t.Run("fail-close", func(t *testing.T) {
 		client := newTestClient(t, handler, WithFailClose())
 
-		_, _, err := client.CheckPassword(ctx, pwPassword)
+		_, err := client.CheckPassword(ctx, pwPassword)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("error = %v, want context.Canceled", err)
 		}
@@ -524,7 +529,7 @@ func TestNoRetries(t *testing.T) {
 				w.WriteHeader(status)
 			})
 
-			if _, _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+			if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 			if n := calls.Load(); n != 1 {
@@ -586,7 +591,7 @@ func TestLogLevels(t *testing.T) {
 			logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 			client := newTestClient(t, tc.handler, WithLogger(logger))
-			if _, _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+			if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
@@ -624,7 +629,8 @@ func TestSuccessIsNotLogged(t *testing.T) {
 
 	client := newTestClient(t, jsonHandler(fmt.Sprintf(`{"%s": 5}`, suffixPassword)), WithLogger(logger))
 
-	leaked, count, err := client.CheckPassword(context.Background(), pwPassword)
+	res, err := client.CheckPassword(context.Background(), pwPassword)
+	leaked, count := res.Leaked, res.Count
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -738,7 +744,8 @@ func TestConcurrentUse(t *testing.T) {
 
 	for range goroutines {
 		go func() {
-			leaked, count, err := client.CheckPassword(context.Background(), pwPassword)
+			res, err := client.CheckPassword(context.Background(), pwPassword)
+			leaked, count := res.Leaked, res.Count
 			switch {
 			case err != nil:
 				errs <- err
@@ -763,7 +770,7 @@ func ExampleClient_CheckPassword() {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	leaked, count, err := client.CheckPassword(ctx, "hunter2")
+	res, err := client.CheckPassword(ctx, "hunter2")
 	if err != nil {
 		// Unreachable with the default fail-open policy, which reports
 		// transport and upstream failures as "not leaked".
@@ -772,10 +779,20 @@ func ExampleClient_CheckPassword() {
 		return
 	}
 
-	if leaked {
-		fmt.Printf("password found in %d breaches\n", count)
-	} else {
+	// Suitable as a metric label: checked, skipped_timeout,
+	// skipped_rate_limited, skipped_error or skipped_canceled.
+	fmt.Println("outcome:", res.Outcome)
+
+	switch {
+	case res.Leaked:
+		fmt.Printf("password found in %d breaches\n", res.Count)
+	case res.Outcome.Checked():
 		fmt.Println("password not found in any known breach")
+	default:
+		// The check did not run. Under fail-open the login continues, but
+		// the caller can see it and react - by requiring a second factor,
+		// for example.
+		fmt.Println("check skipped:", res.Outcome)
 	}
 }
 
@@ -790,7 +807,7 @@ func TestCustomTransportIsUsed(t *testing.T) {
 
 	client := newTestClient(t, jsonHandler("{}"), WithHTTPClient(hc))
 
-	if _, _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+	if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
 		t.Fatalf("CheckPassword: %v", err)
 	}
 	if got := rounds.Load(); got != 1 {
@@ -814,14 +831,17 @@ func TestCustomClientStillBoundedByTimeout(t *testing.T) {
 	)
 
 	start := time.Now()
-	leaked, count, err := client.CheckPassword(context.Background(), pwPassword)
+	res, err := client.CheckPassword(context.Background(), pwPassword)
 	elapsed := time.Since(start)
 
 	if err != nil {
 		t.Fatalf("fail-open must swallow the timeout, got %v", err)
 	}
-	if leaked || count != 0 {
-		t.Errorf("got (%v, %d), want (false, 0)", leaked, count)
+	if res.Leaked || res.Count != 0 {
+		t.Errorf("got (%v, %d), want (false, 0)", res.Leaked, res.Count)
+	}
+	if res.Outcome != OutcomeSkippedTimeout {
+		t.Errorf("outcome = %v, want skipped_timeout", res.Outcome)
 	}
 	if elapsed > 150*time.Millisecond {
 		t.Errorf("took %v, want it bounded near the 20ms timeout", elapsed)
@@ -842,9 +862,9 @@ func ExampleWithHTTPClient() {
 	// deadline on every call.
 	client := NewClient("your-api-key", WithHTTPClient(hc))
 
-	leaked, count, err := client.CheckPassword(context.Background(), "hunter2")
-	if err == nil && leaked {
-		fmt.Printf("password found in %d breaches\n", count)
+	res, err := client.CheckPassword(context.Background(), "hunter2")
+	if err == nil && res.Leaked {
+		fmt.Printf("password found in %d breaches\n", res.Count)
 	}
 }
 

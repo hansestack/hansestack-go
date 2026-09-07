@@ -16,8 +16,9 @@ login handlers, sign-up flows, password-change endpoints, authentication
 middleware.
 
 Do not invent symbols. The complete public API is listed under `## API`.
-Nothing else is exported. In particular there is no result struct, no
-`CheckResult` type, and no `Check`, `Verify` or `IsLeaked` method.
+Nothing else is exported. There is exactly ONE method, `CheckPassword`, and it
+returns `(Result, error)`. There is no `CheckResult` type and no `Check`,
+`Verify` or `IsLeaked` method.
 
 ## PRIME DIRECTIVE: FAIL OPEN
 
@@ -38,8 +39,8 @@ RULE 2 — Never add `WithFailClose()` to an interactive authentication flow.
 RULE 3 — In the default configuration, `err` is ALWAYS `nil`.
   This is the single most misunderstood part of this API. The client already
   catches network errors, timeouts, 429 and 5xx internally, logs them, and
-  returns `(false, 0, nil)`. A non-nil error is only reachable if someone
-  opted into `WithFailClose()`.
+  returns a `Result` with `Leaked == false` and an `Outcome` naming the reason.
+  A non-nil error is only reachable if someone opted into `WithFailClose()`.
 
 RULE 4 — Handle `err` defensively anyway, and treat it as "safe, proceed".
   The signature permits a non-nil error, and the client you are wiring into
@@ -78,8 +79,27 @@ This is the complete exported surface. Nothing else exists.
 // Constructor.
 func NewClient(apiKey string, opts ...Option) *Client
 
-// The only method. Returns (leaked, breachCount, err).
-func (c *Client) CheckPassword(ctx context.Context, password string) (bool, int, error)
+// The only method.
+func (c *Client) CheckPassword(ctx context.Context, password string) (Result, error)
+
+type Result struct {
+	Leaked  bool    // meaningful only when Outcome is OutcomeChecked
+	Count   int     // meaningful only when Outcome is OutcomeChecked
+	Outcome Outcome
+}
+
+type Outcome uint8
+func (o Outcome) String() string // stable metric label
+func (o Outcome) Checked() bool  // true only for OutcomeChecked
+
+const (
+	OutcomeUnknown            Outcome = iota // zero value; never returned
+	OutcomeChecked                           // "checked"
+	OutcomeSkippedTimeout                    // "skipped_timeout"
+	OutcomeSkippedRateLimited                // "skipped_rate_limited"
+	OutcomeSkippedError                      // "skipped_error"
+	OutcomeSkippedCanceled                   // "skipped_canceled"
+)
 
 // Options.
 type Option func(*Client)
@@ -94,17 +114,29 @@ const DefaultTimeout = 500 * time.Millisecond
 
 Return values of `CheckPassword`:
 
-- `leaked bool` — true if the password was found in the breach corpus.
-- `count int` — number of times it was seen. Meaningful only when `leaked`
-  is true. May legitimately be `0` even when `leaked` is true.
+- `Result.Leaked` — true if the password was found in the breach corpus.
+- `Result.Count` — number of times it was seen. Meaningful only when `Leaked`
+  is true. May legitimately be `0` even when `Leaked` is true.
+- `Result.Outcome` — whether the check actually ran, and if not, why.
 - `err error` — always `nil` unless the client was built with
-  `WithFailClose()`. A non-nil error always accompanies `(false, 0)`, so
+  `WithFailClose()`. A non-nil error always accompanies `Leaked == false`, so
   treating an error as "not leaked" is always correct.
 
 `WithHTTPClient` swaps the transport, not the contract: the client timeout is
 still applied as a context deadline, so a supplied client without its own
 `Timeout` stays bounded. Use it to put a circuit breaker, metrics or tracing in
 a `RoundTripper` you own.
+
+Under fail-open, a password that is not in the corpus and a check that never
+ran both read as "not leaked". `Result.Outcome` is what keeps them apart. Use
+`Outcome.String()` as a metric label to see how often the control is skipped;
+ignoring Outcome entirely is safe and behaves like a plain leak check.
+
+`skipped_timeout` means the deadline expired — the API was slow.
+`skipped_canceled` means the caller's context was cancelled, usually a user who
+navigated away, and says nothing about the API. Keep them apart on dashboards.
+`Outcome` implements `encoding.TextMarshaler`, so a `Result` in a JSON log line
+carries the label, not the integer.
 
 Error sentinels, for `errors.Is`. Only reachable under `WithFailClose()`:
 
@@ -172,7 +204,7 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Always pass the request context so the check inherits cancellation.
-	leaked, count, err := s.leaks.CheckPassword(r.Context(), req.Password)
+	res, err := s.leaks.CheckPassword(r.Context(), req.Password)
 	if err != nil {
 		// FAIL OPEN. Log and continue as if the password were safe.
 		// Never return 5xx here. With the default client this branch is
@@ -181,10 +213,10 @@ func (s *Server) handleSignup(w http.ResponseWriter, r *http.Request) {
 			"error", err)
 	}
 
-	if leaked {
+	if res.Leaked {
 		// A confirmed leak is a validation failure: 4xx, not 5xx.
 		http.Error(w,
-			fmt.Sprintf("this password appeared in %d known data breaches, please choose another", count),
+			fmt.Sprintf("this password appeared in %d known data breaches, please choose another", res.Count),
 			http.StatusBadRequest)
 		return
 	}
@@ -208,7 +240,7 @@ WRONG — returning 5xx because the check failed. This is the failure this
 library exists to prevent: an outage at Hansestack locks every user out.
 
 ```go
-leaked, _, err := client.CheckPassword(ctx, pw)
+res, err := client.CheckPassword(ctx, pw)
 if err != nil {
 	http.Error(w, "internal server error", http.StatusInternalServerError) // NO
 	return
@@ -218,7 +250,7 @@ if err != nil {
 RIGHT — log and continue.
 
 ```go
-leaked, _, err := client.CheckPassword(ctx, pw)
+res, err := client.CheckPassword(ctx, pw)
 if err != nil {
 	logger.Warn("leak check unavailable, continuing", "error", err)
 }
@@ -262,7 +294,7 @@ WRONG — retry or back off around the call.
 
 ```go
 for i := 0; i < 3; i++ { // NO. Never retry; the client is single-attempt by design.
-	leaked, _, err = client.CheckPassword(ctx, pw)
+	res, err = client.CheckPassword(ctx, pw)
 	if err == nil {
 		break
 	}
@@ -311,20 +343,20 @@ breach corpus. It is not used as a security control. Do not "upgrade" it.
 
 Default client (fail-open). `err` is always nil; the library logs internally.
 
-| Condition            | Returns          | Library logs | Your action                    |
-| -------------------- | ---------------- | ------------ | ------------------------------ |
-| Password found       | `(true, N, nil)` | —            | Reject with 400/422             |
-| Password not found   | `(false, 0, nil)`| —            | Continue                        |
-| Timeout (>500ms)     | `(false, 0, nil)`| WARN         | Continue                        |
-| Network/DNS/TLS fail | `(false, 0, nil)`| WARN         | Continue                        |
-| 429 rate limited     | `(false, 0, nil)`| WARN         | Continue. Never sleep or retry. |
-| 5xx upstream fault   | `(false, 0, nil)`| WARN         | Continue                        |
-| 401/403 bad API key  | `(false, 0, nil)`| ERROR        | Continue. Alert operators.      |
-| 4xx malformed        | `(false, 0, nil)`| ERROR        | Continue. Alert operators.      |
+| Condition            | Result.Outcome        | Library logs | Your action                     |
+| -------------------- | --------------------- | ------------ | ------------------------------- |
+| Password found       | `checked`, leaked     | —            | Reject with 400/422             |
+| Password not found   | `checked`, not leaked | —            | Continue                        |
+| Timeout (>500ms)     | `skipped_timeout`     | WARN         | Continue                        |
+| Network/DNS/TLS fail | `skipped_error`       | WARN         | Continue                        |
+| 429 rate limited     | `skipped_rate_limited`| WARN         | Continue. Never sleep or retry. |
+| 5xx upstream fault   | `skipped_error`       | WARN         | Continue                        |
+| 401/403 bad API key  | `skipped_error`       | ERROR        | Continue. Alert operators.      |
+| 4xx malformed        | `skipped_error`       | ERROR        | Continue. Alert operators.      |
 
-With `WithFailClose()` the same conditions return `(false, 0, err)` wrapping
-the matching sentinel. The boolean and integer results are identical in both
-modes; only error propagation differs.
+With `WithFailClose()` the same conditions return the same `Result` plus an
+error wrapping the matching sentinel. The Result is identical in both modes;
+only error propagation differs.
 
 Timing: one attempt, hard-bounded at 500ms by default. A shorter deadline on
 the context you pass wins. Worst-case added latency to your handler is the
