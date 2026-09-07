@@ -158,6 +158,7 @@ func TestOutcomeString(t *testing.T) {
 		OutcomeSkippedRateLimited: "skipped_rate_limited",
 		OutcomeSkippedError:       "skipped_error",
 		OutcomeSkippedCanceled:    "skipped_canceled",
+		OutcomeSkippedCircuitOpen: "skipped_circuit_open",
 		Outcome(200):              "Outcome(200)",
 	}
 
@@ -219,6 +220,7 @@ func TestOutcomeTextRoundTrip(t *testing.T) {
 		OutcomeSkippedRateLimited,
 		OutcomeSkippedError,
 		OutcomeSkippedCanceled,
+		OutcomeSkippedCircuitOpen,
 	} {
 		text, err := want.MarshalText()
 		if err != nil {

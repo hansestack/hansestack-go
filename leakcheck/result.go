@@ -46,6 +46,13 @@ const (
 	//
 	// Appended rather than inserted: the numeric values never shift.
 	OutcomeSkippedCanceled
+
+	// OutcomeSkippedCircuitOpen means [WithCircuitBreaker] short-circuited the
+	// call and no request was sent. Kept apart from OutcomeSkippedError for
+	// the same reason: during an outage the two describe different things —
+	// one call paid the timeout, the rest cost nothing — and a dashboard that
+	// merges them cannot show that the breaker is doing its job.
+	OutcomeSkippedCircuitOpen
 )
 
 // String returns a short, stable, lower-case identifier suitable for use as a
@@ -62,6 +69,8 @@ func (o Outcome) String() string {
 		return "skipped_error"
 	case OutcomeSkippedCanceled:
 		return "skipped_canceled"
+	case OutcomeSkippedCircuitOpen:
+		return "skipped_circuit_open"
 	case OutcomeUnknown:
 		return "unknown"
 	default:
@@ -93,6 +102,8 @@ func (o *Outcome) UnmarshalText(text []byte) error {
 		*o = OutcomeSkippedError
 	case "skipped_canceled":
 		*o = OutcomeSkippedCanceled
+	case "skipped_circuit_open":
+		*o = OutcomeSkippedCircuitOpen
 	case "unknown":
 		*o = OutcomeUnknown
 	default:
@@ -133,6 +144,8 @@ func outcomeFor(err error) Outcome {
 		return OutcomeSkippedCanceled
 	case errors.Is(err, ErrRateLimited):
 		return OutcomeSkippedRateLimited
+	case errors.Is(err, ErrCircuitOpen):
+		return OutcomeSkippedCircuitOpen
 	default:
 		return OutcomeSkippedError
 	}

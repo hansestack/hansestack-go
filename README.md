@@ -95,6 +95,7 @@ client := leakcheck.NewClient(apiKey,
 | `WithLogger(l)` | discard | `*slog.Logger` for internal diagnostics. `nil` is ignored. |
 | `WithFailClose()` | fail open | Return errors to the caller instead of swallowing them. |
 | `WithHTTPClient(hc)` | internal client | Carry requests through your own `*http.Client`, e.g. to add a circuit breaker, metrics or tracing in a `RoundTripper`. `nil` is ignored. The context deadline still bounds every call. |
+| `WithCircuitBreaker(n, d)` | off | Stop sending after `n` consecutive failures and skip the check for `d`, then let one probe through. |
 
 ### Bringing your own HTTP client
 
@@ -140,6 +141,58 @@ case !res.Outcome.Checked() && suspiciousLogin(r):
 | `OutcomeSkippedRateLimited` | `false` | The API answered `429`. |
 | `OutcomeSkippedError` | `false` | Connection error, upstream `5xx`, unreadable body, or misconfiguration. |
 | `OutcomeSkippedCanceled` | `false` | The caller's context was cancelled — a user who navigated away. Kept apart from a timeout so a rise in `skipped_timeout` still means the API got slow. |
+| `OutcomeSkippedCircuitOpen` | `false` | The breaker was open; no request was sent. See below. |
+
+### Surviving an outage
+
+Without a breaker, an unreachable API costs every single login the full request
+timeout, because each call waits for its own deadline. `WithCircuitBreaker`
+turns that wait into an immediate fail-open skip after a few consecutive
+failures, and probes for recovery once per cooldown:
+
+```go
+client := leakcheck.NewClient(apiKey,
+    leakcheck.WithCircuitBreaker(5, 30*time.Second),
+)
+```
+
+Both values are plain arguments so they can come from your own configuration:
+
+```go
+threshold, _ := strconv.Atoi(os.Getenv("LEAKCHECK_BREAKER_THRESHOLD"))
+cooldown, _ := time.ParseDuration(os.Getenv("LEAKCHECK_BREAKER_COOLDOWN"))
+
+client := leakcheck.NewClient(os.Getenv("LEAKCHECK_API_KEY"),
+    leakcheck.WithCircuitBreaker(threshold, cooldown),
+)
+```
+
+An unset `LEAKCHECK_BREAKER_THRESHOLD` parses to `0`, which leaves the breaker
+off — a missing configuration degrades to the previous behaviour rather than to
+a surprise. An unset cooldown falls back to `DefaultBreakerCooldown`.
+
+Only unavailability counts towards the threshold:
+
+| Failure | Counted | Why |
+| --- | --- | --- |
+| Timeout, connection error | yes | The outage the breaker exists for. |
+| `5xx` | yes | Same. |
+| `429` | yes | Fast, but backing off is the correct response to it. |
+| `401`/`403`, other `4xx`, off-contract status | no | Answers instantly, so there is no latency to win back, and tripping would hide `ErrUnauthorized` behind `ErrCircuitOpen`. |
+| Malformed response body | no | Same. |
+| Caller cancelled the request | no | A user who abandons a login says nothing about the API's health. |
+
+The breaker is off by default and counts *consecutive* failures, so
+intermittent errors never trip a healthy service. Under fail-open a
+short-circuited call is skipped silently; under `WithFailClose` it returns
+`ErrCircuitOpen`, which distinguishes it from a request that was actually
+attempted.
+
+Either way the call reports `OutcomeSkippedCircuitOpen` rather than
+`OutcomeSkippedError`. During an outage that separation is the whole picture:
+`skipped_error` counts the calls that paid a full timeout, `skipped_circuit_open`
+counts the ones the breaker made free. Merged into one label, a working breaker
+and a broken one look identical.
 
 With `WithFailClose`, failures are returned as errors wrapping package
 sentinels — match them with `errors.Is`:

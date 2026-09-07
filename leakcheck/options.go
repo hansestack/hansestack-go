@@ -97,6 +97,35 @@ func WithHTTPClient(hc *http.Client) Option {
 	}
 }
 
+// WithCircuitBreaker stops sending requests after threshold consecutive
+// failures and skips the check outright until cooldown has elapsed.
+//
+// Without it an outage costs every login the full request timeout, because
+// each call waits out its own deadline. The breaker turns that wait into an
+// immediate fail-open skip, then lets a single probe through once the cooldown
+// is over: success closes the circuit, failure restarts the cooldown.
+//
+// Only unavailability counts towards the threshold: timeouts, connection
+// failures, 5xx and 429. A cancelled request, a rejected API key or a
+// malformed one answer instantly and are left uncounted, so the breaker never
+// masks [ErrUnauthorized] behind [ErrCircuitOpen].
+//
+// Off by default. A non-positive threshold disables it, so a value read from
+// unset configuration degrades to the previous behaviour instead of to a
+// surprise; a non-positive cooldown falls back to [DefaultBreakerCooldown].
+// Under [WithFailClose] a short-circuited call returns [ErrCircuitOpen].
+func WithCircuitBreaker(threshold int, cooldown time.Duration) Option {
+	return func(c *Client) {
+		if threshold <= 0 {
+			return
+		}
+		if cooldown <= 0 {
+			cooldown = DefaultBreakerCooldown
+		}
+		c.breaker = &breaker{threshold: threshold, cooldown: cooldown}
+	}
+}
+
 // withBaseURL overrides the API base URL.
 //
 // This option is deliberately unexported. The Hansestack Leak-Check API base
