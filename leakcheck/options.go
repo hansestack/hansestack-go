@@ -2,6 +2,7 @@ package leakcheck
 
 import (
 	"log/slog"
+	"net/http"
 	"time"
 )
 
@@ -73,6 +74,26 @@ func WithLogger(logger *slog.Logger) Option {
 			return
 		}
 		c.logger = logger
+	}
+}
+
+// WithHTTPClient makes the client issue its requests through hc instead of the
+// [http.Client] constructed by [NewClient].
+//
+// Use it to attach transport-level behaviour this package deliberately leaves
+// out — a circuit breaker, pool tuning, metrics, tracing — in a
+// [http.RoundTripper] the caller owns.
+//
+// The fail-open contract holds either way: [Client.CheckPassword] applies the
+// client timeout as a context deadline, so an hc without its own Timeout is
+// still bounded and the earlier of the two deadlines wins. A nil client is a
+// no-op, so an unset dependency cannot silently disable timeouts.
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) {
+		if hc == nil {
+			return
+		}
+		c.httpClient = hc
 	}
 }
 

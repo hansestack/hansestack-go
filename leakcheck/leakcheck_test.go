@@ -700,6 +700,26 @@ func TestOptions(t *testing.T) {
 		c.logger.Info("ping") // must not panic
 	})
 
+	t.Run("WithHTTPClient replaces the default client", func(t *testing.T) {
+		hc := &http.Client{}
+		c := NewClient("k", WithHTTPClient(hc))
+
+		if c.httpClient != hc {
+			t.Error("httpClient is not the supplied client")
+		}
+	})
+
+	t.Run("WithHTTPClient ignores nil", func(t *testing.T) {
+		c := NewClient("k", WithHTTPClient(nil))
+
+		if c.httpClient == nil {
+			t.Fatal("httpClient = nil, want the default client")
+		}
+		if c.httpClient.Timeout != DefaultTimeout {
+			t.Errorf("httpClient.Timeout = %v, want default %v", c.httpClient.Timeout, DefaultTimeout)
+		}
+	})
+
 	t.Run("later options win", func(t *testing.T) {
 		c := NewClient("k", WithTimeout(time.Second), WithTimeout(3*time.Second))
 		if c.timeout != 3*time.Second {
@@ -758,3 +778,77 @@ func ExampleClient_CheckPassword() {
 		fmt.Println("password not found in any known breach")
 	}
 }
+
+// TestCustomTransportIsUsed proves the supplied client actually carries the
+// request; a RoundTripper that never runs cannot host a breaker or metrics.
+func TestCustomTransportIsUsed(t *testing.T) {
+	var rounds atomic.Int64
+	hc := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		rounds.Add(1)
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+
+	client := newTestClient(t, jsonHandler("{}"), WithHTTPClient(hc))
+
+	if _, _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+		t.Fatalf("CheckPassword: %v", err)
+	}
+	if got := rounds.Load(); got != 1 {
+		t.Errorf("custom transport rounds = %d, want 1", got)
+	}
+}
+
+// TestCustomClientStillBoundedByTimeout guards the fail-open contract: a
+// supplied client with no Timeout of its own must still not hang the caller,
+// because the context deadline bounds the call whatever carries it.
+func TestCustomClientStillBoundedByTimeout(t *testing.T) {
+	slow := func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte("{}"))
+	}
+
+	client := newTestClient(t, slow,
+		WithHTTPClient(&http.Client{}), // no Timeout set
+		WithTimeout(20*time.Millisecond),
+	)
+
+	start := time.Now()
+	leaked, count, err := client.CheckPassword(context.Background(), pwPassword)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("fail-open must swallow the timeout, got %v", err)
+	}
+	if leaked || count != 0 {
+		t.Errorf("got (%v, %d), want (false, 0)", leaked, count)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Errorf("took %v, want it bounded near the 20ms timeout", elapsed)
+	}
+}
+
+func ExampleWithHTTPClient() {
+	// Any http.RoundTripper can wrap the call — metrics, tracing, or a breaker
+	// from a library already in the binary. This one only counts requests.
+	var requests atomic.Int64
+	hc := &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		requests.Add(1)
+
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+
+	// hc needs no Timeout of its own: the client applies its own as a context
+	// deadline on every call.
+	client := NewClient("your-api-key", WithHTTPClient(hc))
+
+	leaked, count, err := client.CheckPassword(context.Background(), "hunter2")
+	if err == nil && leaked {
+		fmt.Printf("password found in %d breaches\n", count)
+	}
+}
+
+// roundTripperFunc adapts a function to [http.RoundTripper].
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

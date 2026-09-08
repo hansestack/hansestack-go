@@ -86,6 +86,7 @@ type Option func(*Client)
 func WithTimeout(d time.Duration) Option // default: DefaultTimeout (500ms); non-positive ignored
 func WithLogger(l *slog.Logger) Option   // default: discard logger; nil ignored
 func WithFailClose() Option              // default: fail open. Do not use in auth flows.
+func WithHTTPClient(hc *http.Client) Option // default: internal client; nil ignored
 
 // Constant.
 const DefaultTimeout = 500 * time.Millisecond
@@ -99,6 +100,11 @@ Return values of `CheckPassword`:
 - `err error` — always `nil` unless the client was built with
   `WithFailClose()`. A non-nil error always accompanies `(false, 0)`, so
   treating an error as "not leaked" is always correct.
+
+`WithHTTPClient` swaps the transport, not the contract: the client timeout is
+still applied as a context deadline, so a supplied client without its own
+`Timeout` stays bounded. Use it to put a circuit breaker, metrics or tracing in
+a `RoundTripper` you own.
 
 Error sentinels, for `errors.Is`. Only reachable under `WithFailClose()`:
 
