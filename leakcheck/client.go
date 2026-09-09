@@ -38,13 +38,13 @@
 //
 //	client := leakcheck.NewClient(os.Getenv("HANSESTACK_API_KEY"))
 //
-//	leaked, count, err := client.CheckPassword(ctx, password)
+//	res, err := client.CheckPassword(ctx, password)
 //	if err != nil {
 //		// Only reachable with WithFailClose; the default never errors here.
 //		return err
 //	}
-//	if leaked {
-//		return fmt.Errorf("password appeared in %d known breaches", count)
+//	if res.Leaked {
+//		return fmt.Errorf("password appeared in %d known breaches", res.Count)
 //	}
 //
 // A Client is safe for concurrent use by multiple goroutines.
@@ -177,6 +177,49 @@ func NewClient(apiKey string, opts ...Option) *Client {
 	return c
 }
 
+// CheckPassword reports whether password appears in the breach corpus, how
+// many times it was seen, and whether the check actually ran.
+//
+// Only the first five characters of the password's uppercase SHA-1 digest are
+// sent to the API. The password itself, the full digest and the digest suffix
+// never leave the process; see the package documentation for details.
+//
+// The request is bounded by the client timeout ([DefaultTimeout] by default).
+// If ctx carries an earlier deadline, that deadline wins. Exactly one attempt
+// is made: this client never retries, including on 429 and 5xx.
+//
+// In the default fail-open mode the error is always nil: network failures,
+// timeouts, rate limiting, upstream faults and misconfiguration are logged and
+// reported as a [Result] whose Outcome names the reason, so the caller's flow
+// proceeds as if no check had run. [WithFailClose] returns those conditions as
+// errors wrapping the package sentinels — match them with [errors.Is] — and
+// populates Outcome all the same.
+//
+// Leaked and Count carry a verdict only when Outcome is [OutcomeChecked]; for
+// every other outcome they hold the neutral false and 0, so a caller that
+// ignores Outcome still reads a skipped check as "not leaked".
+func (c *Client) CheckPassword(ctx context.Context, password string) (Result, error) {
+	prefix, suffix := hashPassword(password)
+
+	// Applied even when ctx already has a deadline: WithTimeout only ever
+	// shortens, so the effective bound is the earlier of the two.
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	suffixes, err := c.fetchPrefix(ctx, prefix)
+	if err != nil {
+		return Result{Outcome: outcomeFor(err)}, c.failErr(err)
+	}
+
+	// Case-sensitive lookup against the uppercase hex suffix, matching the
+	// key format the API guarantees.
+	if count, ok := suffixes[suffix]; ok {
+		return Result{Leaked: true, Count: count, Outcome: OutcomeChecked}, nil
+	}
+
+	return Result{Outcome: OutcomeChecked}, nil
+}
+
 // hashPassword computes the k-anonymity prefix and suffix for a password.
 //
 // It returns the uppercase hex SHA-1 digest split after [prefixLength]
@@ -191,61 +234,19 @@ func hashPassword(password string) (prefix, suffix string) {
 	return digest[:prefixLength], digest[prefixLength:]
 }
 
-// CheckPassword reports whether password appears in the breach corpus and, if
-// so, how many times it was seen.
-//
-// Only the first five characters of the password's uppercase SHA-1 digest are
-// sent to the API. The password itself, the full digest and the digest suffix
-// never leave the process; see the package documentation for details.
-//
-// The request is bounded by the client timeout ([DefaultTimeout] by default).
-// If ctx carries an earlier deadline, that deadline wins. Exactly one attempt
-// is made: this client never retries, including on 429 and 5xx.
-//
-// In the default fail-open mode the error result is always nil. Network
-// failures, timeouts, rate limiting, upstream faults and misconfiguration are
-// logged and reported as (false, 0, nil), so the caller's flow proceeds as if
-// no check had run. With [WithFailClose] those conditions are returned as
-// errors wrapping the sentinels declared in this package; match them with
-// [errors.Is].
-//
-// A non-nil error always accompanies a (false, 0) result, so callers that
-// treat errors as "not leaked" remain correct in either mode.
-func (c *Client) CheckPassword(ctx context.Context, password string) (bool, int, error) {
-	prefix, suffix := hashPassword(password)
-
-	// Applied even when ctx already has a deadline: WithTimeout only ever
-	// shortens, so the effective bound is the earlier of the two.
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-
-	suffixes, err := c.fetchPrefix(ctx, prefix)
-	if err != nil {
-		return c.fail(err)
-	}
-
-	// Case-sensitive lookup against the uppercase hex suffix, matching the
-	// key format the API guarantees.
-	if count, ok := suffixes[suffix]; ok {
-		return true, count, nil
-	}
-
-	return false, 0, nil
-}
-
-// fail applies the configured failure policy.
+// failErr applies the configured failure policy.
 //
 // Under fail-close the error is returned to the caller. Under the default
 // fail-open policy it is discarded and a neutral "not leaked" result is
-// reported, so a failing check never blocks an authentication flow. The
+// dropped, so a failing check never blocks an authentication flow. The
 // failure has already been logged at the point where it was detected, with the
 // level and attributes appropriate to its cause.
-func (c *Client) fail(err error) (bool, int, error) {
+func (c *Client) failErr(err error) error {
 	if c.failClose {
-		return false, 0, err
+		return err
 	}
 
-	return false, 0, nil
+	return nil
 }
 
 // fetchPrefix performs the single GET against /v1/prefixes/{prefix} and
