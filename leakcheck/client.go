@@ -124,6 +124,12 @@ var (
 	// ErrRequestFailed indicates the request never produced a response:
 	// DNS failure, connection refused, a TLS error, or an expired deadline.
 	ErrRequestFailed = errors.New("leakcheck: request failed")
+
+	// ErrCircuitOpen indicates the request was not attempted because the
+	// circuit breaker is open after repeated failures. Only returned under
+	// [WithFailClose]; under the default fail-open policy the check is
+	// skipped silently, which is the point of the breaker.
+	ErrCircuitOpen = errors.New("leakcheck: circuit open")
 )
 
 // Client is a Hansestack Leak-Check API client.
@@ -141,6 +147,7 @@ type Client struct {
 	failClose  bool
 	logger     *slog.Logger
 	httpClient *http.Client
+	breaker    *breaker
 }
 
 // NewClient returns a [Client] authenticating with the given API key.
@@ -256,6 +263,56 @@ func (c *Client) failErr(err error) error {
 // where the cause is still known, and returned as an error wrapping one of the
 // package sentinels; the caller applies the fail-open or fail-close policy.
 func (c *Client) fetchPrefix(ctx context.Context, prefix string) (map[string]int, error) {
+	if !c.breaker.allow() {
+		c.logger.WarnContext(ctx, "leakcheck: circuit open, skipping check",
+			"prefix", prefix, "cooldown", c.breaker.cooldown)
+
+		return nil, ErrCircuitOpen
+	}
+
+	suffixes, err := c.fetchPrefixOnce(ctx, prefix)
+	switch {
+	case err == nil:
+		c.breaker.success()
+
+		return suffixes, nil
+	case breakerCounts(err):
+		c.breaker.failure()
+	default:
+		// No verdict on the API's health, so the attempt is discarded rather
+		// than counted. abort also releases a half-open probe, which would
+		// otherwise keep the circuit closed to everyone for good.
+		c.breaker.abort()
+	}
+
+	return nil, err
+}
+
+// breakerCounts reports whether err is evidence that the API is unavailable,
+// rather than a fast deterministic answer that no waiting will change.
+//
+// The breaker exists to stop paying the request timeout during an outage. A
+// rejected API key costs no time, so counting it buys nothing and would hide
+// ErrUnauthorized behind ErrCircuitOpen — an outage symptom for what is a
+// broken integration. A cancelled request is the caller leaving, not the
+// service failing. Rate limiting is the exception: fast, but backing off is
+// the right answer to it.
+func breakerCounts(err error) bool {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return false
+	case errors.Is(err, ErrUnauthorized),
+		errors.Is(err, ErrBadRequest),
+		errors.Is(err, ErrUnexpectedStatus),
+		errors.Is(err, ErrInvalidResponse):
+		return false
+	default:
+		return true
+	}
+}
+
+// fetchPrefixOnce performs the single GET, unaware of the breaker.
+func (c *Client) fetchPrefixOnce(ctx context.Context, prefix string) (map[string]int, error) {
 	endpoint := c.baseURL + "/v1/prefixes/" + url.PathEscape(prefix)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)

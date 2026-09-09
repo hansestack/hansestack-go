@@ -99,6 +99,7 @@ const (
 	OutcomeSkippedRateLimited                // "skipped_rate_limited"
 	OutcomeSkippedError                      // "skipped_error"
 	OutcomeSkippedCanceled                   // "skipped_canceled"
+	OutcomeSkippedCircuitOpen                // "skipped_circuit_open"
 )
 
 // Options.
@@ -107,9 +108,11 @@ func WithTimeout(d time.Duration) Option // default: DefaultTimeout (500ms); non
 func WithLogger(l *slog.Logger) Option   // default: discard logger; nil ignored
 func WithFailClose() Option              // default: fail open. Do not use in auth flows.
 func WithHTTPClient(hc *http.Client) Option // default: internal client; nil ignored
+func WithCircuitBreaker(threshold int, cooldown time.Duration) Option // default: off; non-positive threshold keeps it off
 
-// Constant.
+// Constants.
 const DefaultTimeout = 500 * time.Millisecond
+const DefaultBreakerCooldown = 30 * time.Second
 ```
 
 Return values of `CheckPassword`:
@@ -148,7 +151,18 @@ leakcheck.ErrServerError      // 5xx — upstream fault. Transient.
 leakcheck.ErrUnexpectedStatus // status outside the API contract.
 leakcheck.ErrInvalidResponse  // unreadable or malformed response body.
 leakcheck.ErrRequestFailed    // no response: DNS, connection refused, TLS, timeout.
+leakcheck.ErrCircuitOpen      // never sent: the breaker is open after repeated failures.
 ```
+
+With `WithCircuitBreaker(threshold, cooldown)` the client stops sending after
+`threshold` consecutive *unavailability* failures — timeouts, connection
+errors, `5xx`, `429` — and skips the check outright for `cooldown`, then lets
+one probe through. A rejected API key, a malformed request or a request the
+caller cancelled never count, so the breaker cannot hide a broken integration
+behind `ErrCircuitOpen`. It is off by default and changes no verdict: under
+fail-open a short-circuited call still reads as "not leaked", with
+`Outcome` set to `skipped_circuit_open` so it is countable apart from the
+calls that actually paid a timeout.
 
 ## INITIALIZE
 
@@ -353,6 +367,7 @@ Default client (fail-open). `err` is always nil; the library logs internally.
 | 5xx upstream fault   | `skipped_error`       | WARN         | Continue                        |
 | 401/403 bad API key  | `skipped_error`       | ERROR        | Continue. Alert operators.      |
 | 4xx malformed        | `skipped_error`       | ERROR        | Continue. Alert operators.      |
+| Breaker open         | `skipped_circuit_open`| WARN         | Continue. No request was sent.  |
 
 With `WithFailClose()` the same conditions return the same `Result` plus an
 error wrapping the matching sentinel. The Result is identical in both modes;
