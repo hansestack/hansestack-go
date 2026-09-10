@@ -40,7 +40,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag
+        run: gh release create "$TAG" --title "$TAG" --generate-notes --verify-tag || echo "Release already exists"
 
       - name: Warm module proxy
         continue-on-error: true
