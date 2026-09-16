@@ -121,6 +121,24 @@ your deployment; every API path is appended to it, so both
 never produce a doubled slash in the final request URL. Leave it unset to keep
 using the public SaaS endpoint.
 
+#### Unauthenticated sidecar deployments
+
+A sidecar or local daemon reachable only inside your own Pod or Docker
+network is often run with authentication disabled entirely, since the network
+boundary itself is the security control. Pass an empty string as the API key
+and the client omits the `X-API-Key` header rather than sending it empty:
+
+```go
+client := leakcheck.NewClient("", // no API key: local, unauthenticated sidecar
+	leakcheck.WithEndpoint("http://localhost:8081"),
+)
+```
+
+Only skip the API key against an endpoint you trust and control. The public
+SaaS endpoint, and any deployment with authentication enabled, will reject an
+empty key with an HTTP 401 — which, under the default fail-open policy, is
+logged and reported as "not leaked" rather than failing the request.
+
 ### Bringing your own HTTP client
 
 `WithHTTPClient` swaps the transport, not the contract. Put anything that
