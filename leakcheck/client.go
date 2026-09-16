@@ -156,10 +156,15 @@ type Client struct {
 // a logger backed by [slog.DiscardHandler] so an unconfigured client stays
 // silent. Override them with [WithTimeout], [WithFailClose] and [WithLogger].
 //
-// An empty API key is not rejected here. The client is designed never to panic
-// or fail construction on an auth path; a missing key surfaces as an HTTP 401,
-// which is logged at error level and, under the default fail-open policy,
-// reported as "not leaked".
+// An empty API key is not rejected here, and is a supported configuration:
+// the client omits the X-API-Key header entirely rather than sending it
+// empty. This is intended for a [WithEndpoint] deployment you trust and
+// control — a leak-server running as a sidecar or local daemon with
+// authentication disabled, where the network boundary itself is the security
+// control. Against the public SaaS endpoint, or any deployment with
+// authentication enabled, an empty key is rejected server-side with an HTTP
+// 401, which is logged at error level and, under the default fail-open
+// policy, reported as "not leaked".
 func NewClient(apiKey string, opts ...Option) *Client {
 	c := &Client{
 		apiKey:  apiKey,
@@ -336,7 +341,12 @@ func (c *Client) fetchPrefixOnce(ctx context.Context, prefix string) (map[string
 		return nil, fmt.Errorf("%w: %w", ErrRequestFailed, err)
 	}
 
-	req.Header.Set("X-API-Key", c.apiKey)
+	// An empty API key is a deliberate configuration for an unauthenticated
+	// on-premise deployment (see NewClient), so the header is omitted
+	// entirely rather than sent empty.
+	if c.apiKey != "" {
+		req.Header.Set("X-API-Key", c.apiKey)
+	}
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.httpClient.Do(req)

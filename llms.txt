@@ -137,6 +137,14 @@ of the public SaaS endpoint. Pass the scheme, host and optional port/path
 prefix, e.g. `WithEndpoint("http://localhost:8081")`; the client appends every
 API path to it, so a trailing slash is harmless. An empty string is a no-op.
 
+An empty `apiKey` in `NewClient("", ...)` is valid and supported: the client
+omits the `X-API-Key` header entirely instead of sending it empty. Only pass
+an empty key against a `WithEndpoint` deployment you trust and control, e.g. a
+sidecar with authentication disabled because the network boundary is the
+security control. Against the public SaaS endpoint an empty key is rejected
+with HTTP 401, which under the default fail-open policy surfaces as a skipped
+check, not an error.
+
 Under fail-open, a password that is not in the corpus and a check that never
 ran both read as "not leaked". `Result.Outcome` is what keeps them apart. Use
 `Outcome.String()` as a metric label to see how often the control is skipped;

@@ -330,6 +330,56 @@ func TestRequestShape(t *testing.T) {
 	}
 }
 
+// TestAPIKeyHeader verifies that an empty API key — the supported
+// configuration for an unauthenticated on-premise deployment reached through
+// [WithEndpoint] — omits the X-API-Key header entirely, while a non-empty key
+// still produces it with the correct value.
+func TestAPIKeyHeader(t *testing.T) {
+	t.Run("empty API key omits the header", func(t *testing.T) {
+		var got *http.Request
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = r.Clone(context.Background())
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+		}))
+		t.Cleanup(srv.Close)
+
+		client := NewClient("", WithEndpoint(srv.URL))
+
+		if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got == nil {
+			t.Fatal("handler was never called")
+		}
+		if _, ok := got.Header["X-Api-Key"]; ok {
+			t.Errorf("X-API-Key header present with values %v, want the header omitted entirely", got.Header.Values("X-API-Key"))
+		}
+	})
+
+	t.Run("non-empty API key sets the header", func(t *testing.T) {
+		var got *http.Request
+
+		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			got = r.Clone(context.Background())
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{}`))
+		})
+
+		if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got == nil {
+			t.Fatal("handler was never called")
+		}
+		if v := got.Header.Get("X-API-Key"); v != "test-key" {
+			t.Errorf("X-API-Key = %q, want %q", v, "test-key")
+		}
+	})
+}
+
 // readAll drains a request body, returning nil when there is none.
 func readAll(r *http.Request) ([]byte, error) {
 	if r.Body == nil {
@@ -639,6 +689,20 @@ func TestSuccessIsNotLogged(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Errorf("successful check logged %q, want silence", buf.String())
+	}
+}
+
+// TestNewClientAcceptsEmptyAPIKey verifies that constructing a client with an
+// empty API key succeeds without panicking or otherwise failing, since an
+// empty key is a supported configuration for an unauthenticated on-premise
+// deployment (see NewClient and TestAPIKeyHeader).
+func TestNewClientAcceptsEmptyAPIKey(t *testing.T) {
+	c := NewClient("", WithEndpoint("http://localhost:8081"))
+	if c == nil {
+		t.Fatal("NewClient returned nil")
+	}
+	if c.apiKey != "" {
+		t.Errorf("apiKey = %q, want empty string", c.apiKey)
 	}
 }
 
