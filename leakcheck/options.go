@@ -10,8 +10,7 @@ import (
 // order they are supplied, after all defaults have been established.
 //
 // Option is implemented as a function type rather than an interface because
-// the configuration surface of this client is deliberately small and closed:
-// the base URL is fixed by the API contract and is therefore not exposed.
+// the configuration surface of this client is deliberately small and closed.
 type Option func(*Client)
 
 // WithTimeout overrides the per-request timeout. The default is
@@ -126,13 +125,24 @@ func WithCircuitBreaker(threshold int, cooldown time.Duration) Option {
 	}
 }
 
-// withBaseURL overrides the API base URL.
+// WithEndpoint overrides the API base URL used by the client. The default is
+// the public Hansestack SaaS endpoint.
 //
-// This option is deliberately unexported. The Hansestack Leak-Check API base
-// URL is fixed by the API contract and must not be configurable by users of
-// this library; the option exists solely so that the package's own tests can
-// point the client at an httptest server.
-func withBaseURL(rawURL string) Option {
+// Use it to point the client at a self-hosted, on-premise deployment of the
+// Hansestack leak-check service — for example a sidecar container or a local
+// daemon running inside your own network, which minimizes latency and keeps
+// lookup traffic from leaving your infrastructure. This is also the option to
+// reach for in regulated environments, such as KRITIS operators, that require
+// their own network boundary.
+//
+// rawURL should be the scheme, host, and optional port and path prefix of the
+// service, e.g. "http://localhost:8081" or "https://leakcheck.internal:8443".
+// Every request path is appended to it with [net/url.JoinPath], so a trailing
+// slash on rawURL is harmless and never produces a doubled slash in the final
+// request URL.
+//
+// An empty string is a no-op and leaves the default SaaS endpoint in place.
+func WithEndpoint(rawURL string) Option {
 	return func(c *Client) {
 		if rawURL == "" {
 			return
