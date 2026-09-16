@@ -42,7 +42,7 @@ func newTestClient(t *testing.T, handler http.HandlerFunc, opts ...Option) *Clie
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
 
-	return NewClient("test-key", append([]Option{withBaseURL(srv.URL)}, opts...)...)
+	return NewClient("test-key", append([]Option{WithEndpoint(srv.URL)}, opts...)...)
 }
 
 // jsonHandler serves body as a 200 JSON response.
@@ -461,7 +461,7 @@ func TestNetworkError(t *testing.T) {
 	srv.Close()
 
 	t.Run("fail-open", func(t *testing.T) {
-		client := NewClient("k", withBaseURL(deadURL))
+		client := NewClient("k", WithEndpoint(deadURL))
 
 		res, err := client.CheckPassword(context.Background(), pwPassword)
 		found, count := res.Leaked, res.Count
@@ -474,7 +474,7 @@ func TestNetworkError(t *testing.T) {
 	})
 
 	t.Run("fail-close", func(t *testing.T) {
-		client := NewClient("k", withBaseURL(deadURL), WithFailClose())
+		client := NewClient("k", WithEndpoint(deadURL), WithFailClose())
 
 		if _, err := client.CheckPassword(context.Background(), pwPassword); !errors.Is(err, ErrRequestFailed) {
 			t.Fatalf("error = %v, want errors.Is(_, ErrRequestFailed)", err)
@@ -732,6 +732,62 @@ func TestOptions(t *testing.T) {
 			t.Errorf("timeout = %v, want 3s", c.timeout)
 		}
 	})
+
+	t.Run("WithEndpoint overrides the default base URL", func(t *testing.T) {
+		c := NewClient("k", WithEndpoint("http://localhost:8081"))
+		if c.baseURL != "http://localhost:8081" {
+			t.Errorf("baseURL = %q, want %q", c.baseURL, "http://localhost:8081")
+		}
+	})
+
+	t.Run("WithEndpoint ignores an empty string", func(t *testing.T) {
+		c := NewClient("k", WithEndpoint(""))
+		if c.baseURL != defaultBaseURL {
+			t.Errorf("baseURL = %q, want default %q", c.baseURL, defaultBaseURL)
+		}
+	})
+}
+
+// TestWithEndpointRequestPath verifies that WithEndpoint correctly overrides
+// the base URL and that request paths are joined without a doubled or missing
+// slash, regardless of whether the custom endpoint carries a trailing slash —
+// as would be the case for an on-premise sidecar or local daemon deployment.
+func TestWithEndpointRequestPath(t *testing.T) {
+	tests := []struct {
+		name           string
+		endpointSuffix string // appended to the httptest server URL
+	}{
+		{name: "no trailing slash", endpointSuffix: ""},
+		{name: "trailing slash", endpointSuffix: "/"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotPath string
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := NewClient("test-key", WithEndpoint(srv.URL+tt.endpointSuffix))
+
+			if client.baseURL != srv.URL+tt.endpointSuffix {
+				t.Errorf("baseURL = %q, want %q", client.baseURL, srv.URL+tt.endpointSuffix)
+			}
+
+			if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
+				t.Fatalf("CheckPassword returned error %v, want nil", err)
+			}
+
+			wantPath := "/v1/prefixes/" + prefixPassword
+			if gotPath != wantPath {
+				t.Errorf("request path = %q, want %q (no doubled or missing slash)", gotPath, wantPath)
+			}
+		})
+	}
 }
 
 // TestConcurrentUse exercises the documented goroutine-safety guarantee; run

@@ -96,6 +96,30 @@ client := leakcheck.NewClient(apiKey,
 | `WithFailClose()` | fail open | Return errors to the caller instead of swallowing them. |
 | `WithHTTPClient(hc)` | internal client | Carry requests through your own `*http.Client`, e.g. to add a circuit breaker, metrics or tracing in a `RoundTripper`. `nil` is ignored. The context deadline still bounds every call. |
 | `WithCircuitBreaker(n, d)` | off | Stop sending after `n` consecutive failures and skip the check for `d`, then let one probe through. |
+| `WithEndpoint(url)` | public SaaS endpoint | Override the API base URL, e.g. to reach a self-hosted deployment. Empty strings are ignored. |
+
+### Self-hosted / on-premise deployments
+
+By default the client talks to the public Hansestack SaaS endpoint. If you run
+the Hansestack leak-check service yourself — as a sidecar container or a local
+daemon inside your own network — point the client at it with `WithEndpoint`:
+
+```go
+client := leakcheck.NewClient(apiKey,
+	leakcheck.WithEndpoint("http://localhost:8081"),
+)
+```
+
+This keeps every lookup inside your own network boundary and cuts request
+latency to whatever your local network affords, which also makes it a good
+fit for regulated environments — KRITIS operators among them — that require
+their traffic to stay within a defined perimeter.
+
+`WithEndpoint` accepts the scheme, host, and optional port and path prefix of
+your deployment; every API path is appended to it, so both
+`http://localhost:8081` and `http://localhost:8081/` work identically and
+never produce a doubled slash in the final request URL. Leave it unset to keep
+using the public SaaS endpoint.
 
 ### Bringing your own HTTP client
 

@@ -66,9 +66,9 @@ import (
 )
 
 const (
-	// defaultBaseURL is the fixed production endpoint of the Hansestack
-	// Leak-Check API. It is intentionally not configurable through an
-	// exported option; see withBaseURL.
+	// defaultBaseURL is the public Hansestack SaaS endpoint used unless
+	// [WithEndpoint] overrides it, e.g. to point at a self-hosted,
+	// on-premise deployment.
 	defaultBaseURL = "https://api.hansestack.de/leakcheck"
 
 	// DefaultTimeout bounds every request to the API. It is deliberately
@@ -313,12 +313,23 @@ func breakerCounts(err error) bool {
 
 // fetchPrefixOnce performs the single GET, unaware of the breaker.
 func (c *Client) fetchPrefixOnce(ctx context.Context, prefix string) (map[string]int, error) {
-	endpoint := c.baseURL + "/v1/prefixes/" + url.PathEscape(prefix)
+	// url.JoinPath normalizes exactly one slash between baseURL and the
+	// path segments regardless of whether baseURL carries a trailing
+	// slash, which matters once baseURL is user-supplied via
+	// [WithEndpoint].
+	endpoint, err := url.JoinPath(c.baseURL, "v1", "prefixes", url.PathEscape(prefix))
+	if err != nil {
+		c.logger.ErrorContext(ctx, "leakcheck: could not build request URL",
+			"error", err, "prefix", prefix, "base_url", c.baseURL)
+
+		return nil, fmt.Errorf("%w: %w", ErrRequestFailed, err)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		// Only reachable if baseURL is unparseable, which cannot happen with
-		// the fixed production endpoint.
+		// Only reachable if baseURL is unparseable, which cannot happen
+		// with the fixed production endpoint or a validly formed
+		// WithEndpoint value.
 		c.logger.ErrorContext(ctx, "leakcheck: could not build request",
 			"error", err, "prefix", prefix)
 
