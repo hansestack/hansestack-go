@@ -14,7 +14,7 @@ import (
 // only then is Leaked authoritative.
 func TestCheckOutcomeOnSuccess(t *testing.T) {
 	t.Run("leaked", func(t *testing.T) {
-		client := newTestClient(t, jsonHandler(`{"`+suffixPassword+`":42}`))
+		client := newTestClient(t, rawHandler(map[string]uint32{suffixPassword: 42}))
 
 		res, err := client.CheckPassword(context.Background(), pwPassword)
 		if err != nil {
@@ -32,7 +32,7 @@ func TestCheckOutcomeOnSuccess(t *testing.T) {
 	})
 
 	t.Run("clean miss", func(t *testing.T) {
-		client := newTestClient(t, jsonHandler(`{}`))
+		client := newTestClient(t, rawHandler(nil))
 
 		res, err := client.CheckPassword(context.Background(), pwPassword)
 		if err != nil {
@@ -51,7 +51,7 @@ func TestCheckOutcomeOnSuccess(t *testing.T) {
 // fail-open a skipped check and a clean miss return the same Leaked and Count,
 // and only Outcome tells them apart.
 func TestCheckDistinguishesSkipFromMiss(t *testing.T) {
-	miss := newTestClient(t, jsonHandler(`{}`))
+	miss := newTestClient(t, rawHandler(nil))
 	skipped := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 	})

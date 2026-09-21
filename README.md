@@ -58,8 +58,16 @@ func main() {
 
 The plaintext password never leaves your process, and neither does its full
 hash. The client hashes the password with SHA-1 locally and sends only the
-first five characters of the uppercase hex digest. The server returns every
-known suffix sharing that prefix, and the final comparison happens locally.
+first five characters of the uppercase hex digest, against the `/raw`
+endpoint. The server answers with a raw, memory-mapped binary chunk — not
+JSON — containing every known suffix sharing that prefix as a flat sequence of
+fixed-width 39-byte records (a 35-byte suffix plus a 4-byte count), strictly
+sorted. The client binary-searches that chunk locally with the standard
+library's `sort.Search` and `bytes.Compare`, so the final comparison is an
+O(log n) lookup over raw bytes with zero allocation and zero decoding —
+no JSON parsing, and no third-party protobuf runtime: only the few bytes of
+protobuf tag-and-length framing around the chunk are unwrapped by hand with
+`encoding/binary`. The zero-dependency guarantee holds throughout.
 
 The server therefore learns only that *some* password beginning with a given
 five-character hash prefix was checked — a set spanning a very large number of

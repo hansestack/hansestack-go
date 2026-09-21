@@ -61,8 +61,8 @@ func TestBreakerResetsOnSuccess(t *testing.T) {
 
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(encodeProtoMessage(nil))
 	}, WithCircuitBreaker(2, time.Minute))
 
 	for range 10 {
@@ -90,8 +90,8 @@ func TestBreakerHalfOpenProbe(t *testing.T) {
 
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(encodeProtoMessage(nil))
 	}, WithCircuitBreaker(2, time.Minute))
 
 	now := time.Now()
@@ -197,8 +197,8 @@ func TestBreakerCancelledProbeDoesNotWedge(t *testing.T) {
 		case hang.Load():
 			<-r.Context().Done()
 		case healthy.Load():
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{}`))
+			w.Header().Set("Content-Type", "application/x-protobuf")
+			_, _ = w.Write(encodeProtoMessage(nil))
 		default:
 			w.WriteHeader(http.StatusInternalServerError)
 		}
