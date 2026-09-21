@@ -347,9 +347,13 @@ The plaintext password never leaves the calling process, and neither does its
 full hash.
 
 1. The library computes SHA-1 over the password locally.
-2. It sends ONLY the first 5 characters of the uppercase hex digest.
-3. The server returns all known suffixes sharing that prefix.
-4. The final comparison happens locally, in memory.
+2. It sends ONLY the first 5 characters of the uppercase hex digest, as a GET
+   against the `/raw` endpoint.
+3. The server returns all known suffixes sharing that prefix as a raw,
+   memory-mapped binary chunk (fixed-width records), not JSON.
+4. The final comparison happens locally, in memory, via a zero-allocation
+   binary search over that chunk — no third-party protobuf runtime is used
+   or required.
 
 The server learns only that some password beginning with a given 5-character
 hash prefix was checked — a set spanning a very large number of candidates. It

@@ -6,9 +6,17 @@
 // The plaintext password never leaves the process, and neither does its full
 // hash. The client computes SHA-1 over the password locally, uppercases the
 // 40-character hex digest, and sends only the first five characters — the
-// prefix — to the API. The server answers with every known suffix sharing
-// that prefix, together with a breach count, and the final comparison happens
-// locally against the 35-character suffix.
+// prefix — to the API. The server answers with a raw, memory-mapped binary
+// chunk containing every known suffix sharing that prefix, each paired with a
+// breach count, and the final comparison happens locally against the
+// 35-character suffix.
+//
+// The chunk is a flat sequence of fixed-width 39-byte records (35-byte
+// uppercase hex suffix plus a 4-byte little-endian count), strictly sorted so
+// the client can binary-search it directly with [sort.Search] and
+// [bytes.Compare] — no allocation, no JSON decoding, and no third-party
+// protobuf runtime; only the fixed protobuf tag-and-length header framing the
+// chunk is unwrapped by hand with [encoding/binary].
 //
 // The server therefore learns only that some password beginning with a given
 // five-character hash prefix was checked, a set that spans a very large number
@@ -51,16 +59,18 @@
 package leakcheck
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1" //nolint:gosec // G505: required by the k-anonymity wire protocol, not used as a security control.
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -81,6 +91,21 @@ const (
 	// to the server. The remaining characters form the locally compared
 	// suffix.
 	prefixLength = 5
+
+	// suffixLength is the width, in bytes, of the ASCII suffix stored in each
+	// raw_data record — the 35 remaining hex characters of the 40-character
+	// digest after prefixLength has been removed.
+	suffixLength = 40 - prefixLength
+
+	// countLength is the width, in bytes, of the little-endian uint32 breach
+	// count that follows the suffix in each raw_data record.
+	countLength = 4
+
+	// recordLength is the fixed width, in bytes, of a single record inside
+	// raw_data: a suffixLength-byte ASCII suffix followed by a
+	// countLength-byte little-endian count. Records are strictly sorted by
+	// suffix, which is what makes the local binary search correct.
+	recordLength = suffixLength + countLength
 
 	// maxResponseBytes caps how much of a response body is read. A well-formed
 	// bucket is a few tens of kilobytes; the cap bounds memory use if an
@@ -118,7 +143,9 @@ var (
 	ErrUnexpectedStatus = errors.New("leakcheck: unexpected status")
 
 	// ErrInvalidResponse indicates the response could not be read or was not
-	// the flat JSON object of suffix to breach count that the API promises.
+	// the raw_data-framed sequence of fixed-width suffix/count records that
+	// the API promises: an unrecognised protobuf envelope, a truncated
+	// length, or a payload whose length is not a multiple of the record size.
 	ErrInvalidResponse = errors.New("leakcheck: invalid response body")
 
 	// ErrRequestFailed indicates the request never produced a response:
@@ -218,18 +245,47 @@ func (c *Client) CheckPassword(ctx context.Context, password string) (Result, er
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 
-	suffixes, err := c.fetchPrefix(ctx, prefix)
+	rawData, err := c.fetchPrefix(ctx, prefix)
 	if err != nil {
 		return Result{Outcome: outcomeFor(err)}, c.failErr(err)
 	}
 
 	// Case-sensitive lookup against the uppercase hex suffix, matching the
-	// key format the API guarantees.
-	if count, ok := suffixes[suffix]; ok {
+	// record format the API guarantees.
+	if count, ok := lookupSuffix(rawData, suffix); ok {
 		return Result{Leaked: true, Count: count, Outcome: OutcomeChecked}, nil
 	}
 
 	return Result{Outcome: OutcomeChecked}, nil
+}
+
+// lookupSuffix binary-searches rawData — a flat, strictly sorted sequence of
+// [recordLength]-byte records — for suffix, returning its breach count.
+//
+// rawData is compared directly as bytes with no decoding or allocation: the
+// suffix is looked up as a byte slice against the fixed-width ASCII field at
+// the start of each record, and the count is read out with
+// [binary.LittleEndian] only for the one record that matches. This keeps a
+// bucket of several thousand candidate suffixes to a handful of comparisons.
+func lookupSuffix(rawData []byte, suffix string) (count int, ok bool) {
+	target := []byte(suffix)
+	numRecords := len(rawData) / recordLength
+
+	idx := sort.Search(numRecords, func(i int) bool {
+		start := i * recordLength
+		return bytes.Compare(rawData[start:start+suffixLength], target) >= 0
+	})
+
+	if idx == numRecords {
+		return 0, false
+	}
+
+	start := idx * recordLength
+	if !bytes.Equal(rawData[start:start+suffixLength], target) {
+		return 0, false
+	}
+
+	return int(binary.LittleEndian.Uint32(rawData[start+suffixLength : start+recordLength])), true
 }
 
 // hashPassword computes the k-anonymity prefix and suffix for a password.
@@ -261,13 +317,13 @@ func (c *Client) failErr(err error) error {
 	return nil
 }
 
-// fetchPrefix performs the single GET against /v1/prefixes/{prefix} and
-// decodes the suffix bucket.
+// fetchPrefix performs the single GET against /v1/prefixes/{prefix}/raw and
+// decodes the raw suffix bucket.
 //
 // It is the only place that touches the network. Every failure is logged here,
 // where the cause is still known, and returned as an error wrapping one of the
 // package sentinels; the caller applies the fail-open or fail-close policy.
-func (c *Client) fetchPrefix(ctx context.Context, prefix string) (map[string]int, error) {
+func (c *Client) fetchPrefix(ctx context.Context, prefix string) ([]byte, error) {
 	if !c.breaker.allow() {
 		c.logger.WarnContext(ctx, "leakcheck: circuit open, skipping check",
 			"prefix", prefix, "cooldown", c.breaker.cooldown)
@@ -275,12 +331,12 @@ func (c *Client) fetchPrefix(ctx context.Context, prefix string) (map[string]int
 		return nil, ErrCircuitOpen
 	}
 
-	suffixes, err := c.fetchPrefixOnce(ctx, prefix)
+	rawData, err := c.fetchPrefixOnce(ctx, prefix)
 	switch {
 	case err == nil:
 		c.breaker.success()
 
-		return suffixes, nil
+		return rawData, nil
 	case breakerCounts(err):
 		c.breaker.failure()
 	default:
@@ -317,12 +373,12 @@ func breakerCounts(err error) bool {
 }
 
 // fetchPrefixOnce performs the single GET, unaware of the breaker.
-func (c *Client) fetchPrefixOnce(ctx context.Context, prefix string) (map[string]int, error) {
+func (c *Client) fetchPrefixOnce(ctx context.Context, prefix string) ([]byte, error) {
 	// url.JoinPath normalizes exactly one slash between baseURL and the
 	// path segments regardless of whether baseURL carries a trailing
 	// slash, which matters once baseURL is user-supplied via
 	// [WithEndpoint].
-	endpoint, err := url.JoinPath(c.baseURL, "v1", "prefixes", url.PathEscape(prefix))
+	endpoint, err := url.JoinPath(c.baseURL, "v1", "prefixes", url.PathEscape(prefix), "raw")
 	if err != nil {
 		c.logger.ErrorContext(ctx, "leakcheck: could not build request URL",
 			"error", err, "prefix", prefix, "base_url", c.baseURL)
@@ -347,7 +403,7 @@ func (c *Client) fetchPrefixOnce(ctx context.Context, prefix string) (map[string
 	if c.apiKey != "" {
 		req.Header.Set("X-API-Key", c.apiKey)
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", "application/x-protobuf")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -365,17 +421,72 @@ func (c *Client) fetchPrefixOnce(ctx context.Context, prefix string) (map[string
 		return nil, c.statusError(ctx, prefix, resp)
 	}
 
-	// The body is the map itself: a flat JSON object of suffix to breach
-	// count, with no envelope or wrapper key.
-	var suffixes map[string]int
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&suffixes); err != nil {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
+	if err != nil {
+		c.logger.WarnContext(ctx, "leakcheck: could not read response",
+			"error", err, "prefix", prefix)
+
+		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
+	}
+
+	rawData, err := decodeRawData(body)
+	if err != nil {
 		c.logger.WarnContext(ctx, "leakcheck: could not decode response",
 			"error", err, "prefix", prefix)
 
 		return nil, fmt.Errorf("%w: %w", ErrInvalidResponse, err)
 	}
 
-	return suffixes, nil
+	return rawData, nil
+}
+
+// decodeRawData extracts the raw_data field (protobuf field 1, a length-
+// delimited bytes value) from a minimal single-field protobuf message,
+// without depending on a protobuf runtime.
+//
+// A field 1 of wire type 2 (length-delimited) is always encoded as the tag
+// byte 0x0A followed by the payload length as a base-128 varint and then the
+// payload itself; that fixed shape is all this parses. The returned slice is
+// then validated to be a whole number of [recordLength]-byte records, which
+// is what makes the local binary search over it well-defined.
+func decodeRawData(body []byte) ([]byte, error) {
+	const wantTag = 0x0A // field 1, wire type 2 (length-delimited).
+
+	// proto3 omits a bytes field entirely when it is empty, so an empty body
+	// is the well-formed encoding of a prefix with no known suffixes at all,
+	// not a malformed response.
+	if len(body) == 0 {
+		return nil, nil
+	}
+
+	if body[0] != wantTag {
+		return nil, fmt.Errorf("leakcheck: unrecognized protobuf tag in response")
+	}
+
+	length, n := binary.Uvarint(body[1:])
+	if n <= 0 {
+		return nil, fmt.Errorf("leakcheck: malformed length varint in response")
+	}
+
+	// Bound-check the varint against the body length while both sides are
+	// still uint64: body can never legitimately hold more than
+	// maxResponseBytes, so length is rejected here whether or not it would
+	// otherwise overflow int on conversion below.
+	if length > uint64(len(body)) {
+		return nil, fmt.Errorf("leakcheck: response length %d exceeds body of %d bytes", length, len(body))
+	}
+
+	end := 1 + n + int(length) //nolint:gosec // G115: length was just bounded by len(body) above.
+	if end > len(body) {
+		return nil, fmt.Errorf("leakcheck: response length %d exceeds body of %d bytes", length, len(body))
+	}
+
+	rawData := body[1+n : end]
+	if len(rawData)%recordLength != 0 {
+		return nil, fmt.Errorf("leakcheck: raw_data length %d is not a multiple of %d", len(rawData), recordLength)
+	}
+
+	return rawData, nil
 }
 
 // logTransportError records a failure that produced no HTTP response.

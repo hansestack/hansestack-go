@@ -3,12 +3,14 @@ package leakcheck
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -45,11 +47,71 @@ func newTestClient(t *testing.T, handler http.HandlerFunc, opts ...Option) *Clie
 	return NewClient("test-key", append([]Option{WithEndpoint(srv.URL)}, opts...)...)
 }
 
-// jsonHandler serves body as a 200 JSON response.
+// jsonHandler serves body as a 200 JSON response. It is retained for the
+// malformed-response test cases: a handler serving an old-style JSON body
+// against the new /raw endpoint exercises the "unrecognized protobuf tag"
+// path of [ErrInvalidResponse].
 func jsonHandler(body string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(body))
+	}
+}
+
+// encodeRawData packs suffixes (uppercase 35-character hex strings) mapped to
+// their breach count into the fixed-width record format the /raw endpoint
+// returns: each record is a 35-byte ASCII suffix followed by a 4-byte
+// little-endian count, and records are strictly sorted by suffix.
+func encodeRawData(suffixes map[string]uint32) []byte {
+	keys := make([]string, 0, len(suffixes))
+	for k := range suffixes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	buf := make([]byte, 0, len(keys)*recordLength)
+	for _, k := range keys {
+		if len(k) != suffixLength {
+			panic(fmt.Sprintf("encodeRawData: suffix %q has length %d, want %d", k, len(k), suffixLength))
+		}
+		buf = append(buf, k...)
+
+		var countBytes [countLength]byte
+		binary.LittleEndian.PutUint32(countBytes[:], suffixes[k])
+		buf = append(buf, countBytes[:]...)
+	}
+
+	return buf
+}
+
+// encodeProtoMessage wraps rawData as field 1 (wire type 2) of a minimal
+// protobuf message: tag byte 0x0A, a base-128 varint length, then the payload
+// itself — the exact framing [decodeRawData] parses.
+func encodeProtoMessage(rawData []byte) []byte {
+	var lenBuf [binary.MaxVarintLen64]byte
+	n := binary.PutUvarint(lenBuf[:], uint64(len(rawData)))
+
+	msg := make([]byte, 0, 1+n+len(rawData))
+	msg = append(msg, 0x0A)
+	msg = append(msg, lenBuf[:n]...)
+	msg = append(msg, rawData...)
+
+	return msg
+}
+
+// rawHandler serves suffixes as a 200 response in the binary /raw wire
+// format: a minimal protobuf envelope around the fixed-width record chunk.
+func rawHandler(suffixes map[string]uint32) http.HandlerFunc {
+	return rawProtoHandler(encodeProtoMessage(encodeRawData(suffixes)))
+}
+
+// rawProtoHandler serves body verbatim as a 200 response with the
+// /raw endpoint's content type. Unlike [rawHandler] it does not validate or
+// re-encode body, so it can also serve deliberately malformed payloads.
+func rawProtoHandler(body []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(body)
 	}
 }
 
@@ -122,39 +184,44 @@ func TestCheckPasswordStatuses(t *testing.T) {
 	}{
 		{
 			name: "suffix present reports leaked with count",
-			handler: jsonHandler(fmt.Sprintf(
-				`{"%s": 12345, "0000000000000000000000000000000000A": 1}`, suffixPassword)),
+			handler: rawHandler(map[string]uint32{
+				suffixPassword:                        12345,
+				"0000000000000000000000000000000000A": 1,
+			}),
 			wantFound: true,
 			wantCount: 12345,
 		},
 		{
 			name: "suffix absent reports not leaked",
-			handler: jsonHandler(
-				`{"0000000000000000000000000000000000A": 1, "0000000000000000000000000000000000B": 2}`),
+			handler: rawHandler(map[string]uint32{
+				"0000000000000000000000000000000000A": 1,
+				"0000000000000000000000000000000000B": 2,
+			}),
 		},
 		{
 			name:    "empty bucket reports not leaked",
-			handler: jsonHandler(`{}`),
+			handler: rawHandler(nil),
 		},
 		{
 			name: "lookup is case sensitive so lowercase suffix does not match",
-			handler: jsonHandler(fmt.Sprintf(
-				`{"%s": 99}`, strings.ToLower(suffixPassword))),
+			handler: rawHandler(map[string]uint32{
+				strings.ToLower(suffixPassword): 99,
+			}),
 		},
 		{
 			name:      "count of zero is honoured as reported",
-			handler:   jsonHandler(fmt.Sprintf(`{"%s": 0}`, suffixPassword)),
+			handler:   rawHandler(map[string]uint32{suffixPassword: 0}),
 			wantFound: true,
 			wantCount: 0,
 		},
 		{
-			name:    "malformed json is an invalid response",
+			name:    "json body against the /raw endpoint is an invalid response",
 			handler: jsonHandler(`{"truncated":`),
 			wantErr: ErrInvalidResponse,
 		},
 		{
-			name:    "json array instead of object is an invalid response",
-			handler: jsonHandler(`["not", "an", "object"]`),
+			name:    "raw_data length not a multiple of the record size is an invalid response",
+			handler: rawProtoHandler(encodeProtoMessage([]byte("short"))),
 			wantErr: ErrInvalidResponse,
 		},
 		{
@@ -279,7 +346,8 @@ func TestRequestShape(t *testing.T) {
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		got = r.Clone(context.Background())
 		body, _ = readAll(r)
-		_, _ = w.Write([]byte(`{}`))
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(encodeProtoMessage(nil))
 	})
 
 	if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
@@ -292,7 +360,7 @@ func TestRequestShape(t *testing.T) {
 	if got.Method != http.MethodGet {
 		t.Errorf("method = %q, want %q", got.Method, http.MethodGet)
 	}
-	if want := "/v1/prefixes/" + prefixPassword; got.URL.Path != want {
+	if want := "/v1/prefixes/" + prefixPassword + "/raw"; got.URL.Path != want {
 		t.Errorf("path = %q, want %q", got.URL.Path, want)
 	}
 	if got.URL.RawQuery != "" {
@@ -301,8 +369,8 @@ func TestRequestShape(t *testing.T) {
 	if v := got.Header.Get("X-API-Key"); v != "test-key" {
 		t.Errorf("X-API-Key = %q, want %q", v, "test-key")
 	}
-	if v := got.Header.Get("Accept"); v != "application/json" {
-		t.Errorf("Accept = %q, want application/json", v)
+	if v := got.Header.Get("Accept"); v != "application/x-protobuf" {
+		t.Errorf("Accept = %q, want application/x-protobuf", v)
 	}
 	if len(body) != 0 {
 		t.Errorf("request body = %q, want empty", body)
@@ -340,8 +408,8 @@ func TestAPIKeyHeader(t *testing.T) {
 
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			got = r.Clone(context.Background())
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{}`))
+			w.Header().Set("Content-Type", "application/x-protobuf")
+			_, _ = w.Write(encodeProtoMessage(nil))
 		}))
 		t.Cleanup(srv.Close)
 
@@ -364,8 +432,8 @@ func TestAPIKeyHeader(t *testing.T) {
 
 		client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 			got = r.Clone(context.Background())
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{}`))
+			w.Header().Set("Content-Type", "application/x-protobuf")
+			_, _ = w.Write(encodeProtoMessage(nil))
 		})
 
 		if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
@@ -402,7 +470,8 @@ func TestPrefixIsDerivedPerPassword(t *testing.T) {
 
 	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		paths = append(paths, r.URL.Path)
-		_, _ = w.Write([]byte(`{}`))
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(encodeProtoMessage(nil))
 	})
 
 	for _, pw := range []string{pwPassword, pwHunter2, ""} {
@@ -412,9 +481,9 @@ func TestPrefixIsDerivedPerPassword(t *testing.T) {
 	}
 
 	want := []string{
-		"/v1/prefixes/" + prefixPassword,
-		"/v1/prefixes/" + prefixHunter2,
-		"/v1/prefixes/" + prefixEmpty,
+		"/v1/prefixes/" + prefixPassword + "/raw",
+		"/v1/prefixes/" + prefixHunter2 + "/raw",
+		"/v1/prefixes/" + prefixEmpty + "/raw",
 	}
 	if len(paths) != len(want) {
 		t.Fatalf("got %d requests, want %d", len(paths), len(want))
@@ -438,7 +507,8 @@ func TestTimeout(t *testing.T) {
 		case <-r.Context().Done():
 		case <-time.After(5 * time.Second):
 		}
-		_, _ = w.Write([]byte(`{}`))
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(encodeProtoMessage(nil))
 	}
 
 	t.Run("fail-open swallows the timeout", func(t *testing.T) {
@@ -486,7 +556,8 @@ func TestCallerDeadlineWins(t *testing.T) {
 		case <-r.Context().Done():
 		case <-time.After(5 * time.Second):
 		}
-		_, _ = w.Write([]byte(`{}`))
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		_, _ = w.Write(encodeProtoMessage(nil))
 	}, WithTimeout(10*time.Second), WithFailClose())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -535,7 +606,7 @@ func TestNetworkError(t *testing.T) {
 // TestCanceledContext verifies that an already-canceled caller context is
 // handled by the configured policy rather than panicking or hanging.
 func TestCanceledContext(t *testing.T) {
-	handler := jsonHandler(`{}`)
+	handler := rawHandler(nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -677,7 +748,7 @@ func TestSuccessIsNotLogged(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
-	client := newTestClient(t, jsonHandler(fmt.Sprintf(`{"%s": 5}`, suffixPassword)), WithLogger(logger))
+	client := newTestClient(t, rawHandler(map[string]uint32{suffixPassword: 5}), WithLogger(logger))
 
 	res, err := client.CheckPassword(context.Background(), pwPassword)
 	leaked, count := res.Leaked, res.Count
@@ -831,8 +902,8 @@ func TestWithEndpointRequestPath(t *testing.T) {
 
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotPath = r.URL.Path
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(`{}`))
+				w.Header().Set("Content-Type", "application/x-protobuf")
+				_, _ = w.Write(encodeProtoMessage(nil))
 			}))
 			t.Cleanup(srv.Close)
 
@@ -846,7 +917,7 @@ func TestWithEndpointRequestPath(t *testing.T) {
 				t.Fatalf("CheckPassword returned error %v, want nil", err)
 			}
 
-			wantPath := "/v1/prefixes/" + prefixPassword
+			wantPath := "/v1/prefixes/" + prefixPassword + "/raw"
 			if gotPath != wantPath {
 				t.Errorf("request path = %q, want %q (no doubled or missing slash)", gotPath, wantPath)
 			}
@@ -857,7 +928,7 @@ func TestWithEndpointRequestPath(t *testing.T) {
 // TestConcurrentUse exercises the documented goroutine-safety guarantee; run
 // with -race for it to be meaningful.
 func TestConcurrentUse(t *testing.T) {
-	client := newTestClient(t, jsonHandler(fmt.Sprintf(`{"%s": 7}`, suffixPassword)))
+	client := newTestClient(t, rawHandler(map[string]uint32{suffixPassword: 7}))
 
 	const goroutines = 16
 	errs := make(chan error, goroutines)
@@ -925,7 +996,7 @@ func TestCustomTransportIsUsed(t *testing.T) {
 		return http.DefaultTransport.RoundTrip(r)
 	})}
 
-	client := newTestClient(t, jsonHandler("{}"), WithHTTPClient(hc))
+	client := newTestClient(t, rawHandler(nil), WithHTTPClient(hc))
 
 	if _, err := client.CheckPassword(context.Background(), pwPassword); err != nil {
 		t.Fatalf("CheckPassword: %v", err)
