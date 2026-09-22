@@ -131,8 +131,10 @@ var (
 	ErrBadRequest = errors.New("leakcheck: malformed request")
 
 	// ErrRateLimited indicates the API key exceeded its quota (HTTP 429).
-	// The client never retries or sleeps in response; inspect
-	// X-RateLimit-Reset in logs to pace background workloads.
+	// The client never retries or sleeps in response. Errors wrapping it are
+	// a [*RateLimitError], whose ResetIn field carries the wait the response
+	// advertised; [WithCircuitBreaker] uses it, and [errors.As] exposes it to
+	// callers pacing background workloads.
 	ErrRateLimited = errors.New("leakcheck: rate limited")
 
 	// ErrServerError indicates an upstream fault (HTTP 5xx).
@@ -324,9 +326,15 @@ func (c *Client) failErr(err error) error {
 // where the cause is still known, and returned as an error wrapping one of the
 // package sentinels; the caller applies the fail-open or fail-close policy.
 func (c *Client) fetchPrefix(ctx context.Context, prefix string) ([]byte, error) {
-	if !c.breaker.allow() {
+	// cooldown comes back from allow rather than being read separately: it is
+	// the value the decision was actually made against, and a short-circuited
+	// call should not pay a second lock acquisition just to log it.
+	if allowed, cooldown := c.breaker.allow(); !allowed {
+		// cooldown.String(), not the bare Duration: slog's JSON handler
+		// renders one as an integer count of nanoseconds, which is not a
+		// thing anyone can read off a dashboard.
 		c.logger.WarnContext(ctx, "leakcheck: circuit open, skipping check",
-			"prefix", prefix, "cooldown", c.breaker.cooldown)
+			"prefix", prefix, "cooldown", cooldown.String())
 
 		return nil, ErrCircuitOpen
 	}
@@ -338,7 +346,16 @@ func (c *Client) fetchPrefix(ctx context.Context, prefix string) ([]byte, error)
 
 		return rawData, nil
 	case breakerCounts(err):
-		c.breaker.failure()
+		if cooldown, tripped := c.breaker.failure(err); tripped {
+			// The one line that says why the circuit is open. Reusing the
+			// Outcome label keeps the cause on the same vocabulary as the
+			// metric a caller would group by.
+			c.logger.WarnContext(ctx, "leakcheck: circuit opened, skipping checks",
+				"prefix", prefix,
+				"cause", outcomeFor(err).String(),
+				"cooldown", cooldown.String(),
+			)
+		}
 	default:
 		// No verdict on the API's health, so the attempt is discarded rather
 		// than counted. abort also releases a half-open probe, which would
@@ -517,23 +534,33 @@ func (c *Client) logTransportError(ctx context.Context, prefix string, err error
 // logged at warning level: they are transient and expected, and the fail-open
 // path already contains the impact.
 //
-// No status causes a retry or a delay, including 429. X-RateLimit-Reset is
-// recorded for telemetry only, so that background workloads can be paced out
-// of band; blocking here would push rate-limit latency onto an end user.
+// No status causes a retry or a delay, including 429: the request in hand
+// always fails fast and the caller's flow continues. Blocking here would push
+// rate-limit latency onto an end user. The reset headers are read all the
+// same, so that [WithCircuitBreaker] can wait exactly as long as the API asked
+// rather than falling back to a configured guess.
 func (c *Client) statusError(ctx context.Context, prefix string, resp *http.Response) error {
 	status := resp.StatusCode
 
 	switch {
 	case status == http.StatusTooManyRequests:
+		rateLimited := newRateLimitError(resp, time.Now())
+
 		c.logger.WarnContext(ctx, "leakcheck: rate limited, skipping check",
 			"status", status,
 			"prefix", prefix,
+			"retry_after", resp.Header.Get("Retry-After"),
+			// Zero means neither reset header was usable and the breaker will
+			// keep its configured cooldown. Worth seeing in logs: it is the
+			// difference between waiting as long as the API asked and
+			// guessing.
+			"reset_in", rateLimited.ResetIn.String(),
 			"ratelimit_limit", resp.Header.Get("X-RateLimit-Limit"),
 			"ratelimit_remaining", resp.Header.Get("X-RateLimit-Remaining"),
 			"ratelimit_reset", resp.Header.Get("X-RateLimit-Reset"),
 		)
 
-		return fmt.Errorf("%w (status %d)", ErrRateLimited, status)
+		return rateLimited
 
 	case status == http.StatusUnauthorized, status == http.StatusForbidden:
 		c.logger.ErrorContext(ctx, "leakcheck: API key rejected, check integration",

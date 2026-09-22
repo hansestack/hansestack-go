@@ -109,6 +109,12 @@ func WithLogger(l *slog.Logger) Option   // default: discard logger; nil ignored
 func WithFailClose() Option              // default: fail open. Do not use in auth flows.
 func WithHTTPClient(hc *http.Client) Option // default: internal client; nil ignored
 func WithCircuitBreaker(threshold int, cooldown time.Duration) Option // default: off; non-positive threshold keeps it off
+
+// Typed error for 429, reachable with errors.As. Unwraps to ErrRateLimited.
+type RateLimitError struct {
+	ResetIn    time.Duration // wait the response advertised, clamped 1s..1m; 0 if none was usable
+	StatusCode int           // status the verdict came from; 429 today, not promised to stay the only one
+}
 func WithEndpoint(url string) Option    // default: public SaaS endpoint; empty string ignored
 
 // Constants.
@@ -161,7 +167,7 @@ Error sentinels, for `errors.Is`. Only reachable under `WithFailClose()`:
 ```go
 leakcheck.ErrUnauthorized     // 401/403 — bad or missing API key. Broken integration.
 leakcheck.ErrBadRequest       // other 4xx — malformed request. Broken integration.
-leakcheck.ErrRateLimited      // 429 — quota exceeded. Transient.
+leakcheck.ErrRateLimited      // 429 — quota exceeded. Transient. Errors wrapping it are a *RateLimitError.
 leakcheck.ErrServerError      // 5xx — upstream fault. Transient.
 leakcheck.ErrUnexpectedStatus // status outside the API contract.
 leakcheck.ErrInvalidResponse  // unreadable or malformed response body.
@@ -178,6 +184,14 @@ behind `ErrCircuitOpen`. It is off by default and changes no verdict: under
 fail-open a short-circuited call still reads as "not leaked", with
 `Outcome` set to `skipped_circuit_open` so it is countable apart from the
 calls that actually paid a timeout.
+
+One exception to `cooldown`: a circuit opened by rate limiting ALONE waits for
+the delta the 429 advertised (`Retry-After`, else `X-RateLimit-Reset`) rather
+than for `cooldown`, clamped to 1s..1m. A run mixing 429s with timeouts or 5xx
+keeps `cooldown`, the override never outlives the open state it was read from,
+and a response with no usable header falls back to `cooldown`. This changes
+only how long the check is skipped — it never sleeps a request, so RULE 5
+still holds in full.
 
 ## INITIALIZE
 

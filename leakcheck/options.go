@@ -109,6 +109,24 @@ func WithHTTPClient(hc *http.Client) Option {
 // malformed one answer instantly and are left uncounted, so the breaker never
 // masks [ErrUnauthorized] behind [ErrCircuitOpen].
 //
+// # Rate limits set their own cooldown
+//
+// cooldown is what the circuit serves in every case but one. A 429 differs
+// from the other failures in that the API answers it with a number: the
+// Retry-After or X-RateLimit-Reset header says when the quota returns. So a
+// circuit opened by rate limiting alone waits for the advertised delta
+// instead, clamped to between one second and one minute. Against a bucket
+// that refills each second, that is a second of skipped checks rather than a
+// full cooldown of them.
+//
+// The override applies only when every failure in the run was a rate limit. A
+// 429 mixed in with timeouts or 5xx says nothing about those, and handing its
+// one-second delta to a circuit that tripped on an outage would put the
+// breaker back to probing a dead API every second — the latency it exists to
+// stop paying. It is also scoped to the open state it was read from, so it
+// can never shorten a later outage's wait. A response with no usable header
+// falls back to cooldown.
+//
 // Off by default. A non-positive threshold disables it, so a value read from
 // unset configuration degrades to the previous behaviour instead of to a
 // surprise; a non-positive cooldown falls back to [DefaultBreakerCooldown].
