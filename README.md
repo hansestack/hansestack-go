@@ -103,7 +103,7 @@ client := leakcheck.NewClient(apiKey,
 | `WithLogger(l)` | discard | `*slog.Logger` for internal diagnostics. `nil` is ignored. |
 | `WithFailClose()` | fail open | Return errors to the caller instead of swallowing them. |
 | `WithHTTPClient(hc)` | internal client | Carry requests through your own `*http.Client`, e.g. to add a circuit breaker, metrics or tracing in a `RoundTripper`. `nil` is ignored. The context deadline still bounds every call. |
-| `WithCircuitBreaker(n, d)` | off | Stop sending after `n` consecutive failures and skip the check for `d`, then let one probe through. |
+| `WithCircuitBreaker(n, d)` | off | Stop sending after `n` consecutive failures and skip the check for `d`, then let one probe through. A circuit opened by rate limiting alone waits for the delta the `429` advertised instead of `d`. |
 | `WithEndpoint(url)` | public SaaS endpoint | Override the API base URL, e.g. to reach a self-hosted deployment. Empty strings are ignored. |
 
 ### Self-hosted / on-premise deployments
@@ -227,7 +227,7 @@ Only unavailability counts towards the threshold:
 | --- | --- | --- |
 | Timeout, connection error | yes | The outage the breaker exists for. |
 | `5xx` | yes | Same. |
-| `429` | yes | Fast, but backing off is the correct response to it. |
+| `429` | yes | Fast, but backing off is the correct response to it. Sets its own cooldown — see below. |
 | `401`/`403`, other `4xx`, off-contract status | no | Answers instantly, so there is no latency to win back, and tripping would hide `ErrUnauthorized` behind `ErrCircuitOpen`. |
 | Malformed response body | no | Same. |
 | Caller cancelled the request | no | A user who abandons a login says nothing about the API's health. |
@@ -243,6 +243,53 @@ Either way the call reports `OutcomeSkippedCircuitOpen` rather than
 `skipped_error` counts the calls that paid a full timeout, `skipped_circuit_open`
 counts the ones the breaker made free. Merged into one label, a working breaker
 and a broken one look identical.
+
+#### Rate limits set their own cooldown
+
+`cooldown` is what the circuit serves in every case but one. A `429` differs
+from the other failures in that the API answers it with a number — `Retry-After`
+or `X-RateLimit-Reset` says when the quota returns. A circuit opened by rate
+limiting alone waits for that advertised delta instead:
+
+```go
+// Gateway bucket refills every second, configured cooldown is 30s.
+leakcheck.WithCircuitBreaker(5, 30*time.Second)
+// → 429s open the circuit for ~1s, outages still get the full 30s.
+```
+
+Against a per-second bucket that is a second of skipped checks instead of
+thirty, which is a direct win in how many logins actually get screened.
+
+Three rules keep the override from doing damage:
+
+| Rule | Why |
+| --- | --- |
+| Only a run of **nothing but** `429`s may use it | A `429` among timeouts and `5xx` says nothing about those. Handing its one-second delta to a circuit that tripped on an outage puts the breaker back to probing a dead API every second — the latency it exists to stop paying. |
+| Scoped to **one open state** | The shortened wait belongs to the trip that earned it. Kept on the breaker it would quietly shorten every later outage for the life of the process. |
+| Clamped to **1s–1m** | The value arrives over the network and decides how long a security control stays off. `Retry-After` has one-second resolution and legitimately rounds down to `0`; an `X-RateLimit-Reset` carrying a Unix timestamp instead of a delta would otherwise open the circuit for decades. |
+
+`Retry-After` is preferred where both headers are present: it is specified
+(RFC 9110) and its value is self-describing, whereas `X-RateLimit-Reset` is a
+de-facto convention that carries seconds-remaining at some vendors and a Unix
+timestamp at others. The client discriminates the two by magnitude. A response
+with no usable header simply falls back to `cooldown`, so the header is an
+optimisation and never a correctness condition.
+
+The delta is also available to you directly:
+
+```go
+var rle *leakcheck.RateLimitError
+if errors.As(err, &rle) && rle.ResetIn > 0 {
+    // The API said the quota returns in rle.ResetIn.
+}
+```
+
+`ErrRateLimited` and `RateLimitError.StatusCode` are deliberately separate.
+The verdict is a closed set — one sentinel, one outcome, the thing you branch
+on. The statuses that carry it are not: `429` is canonical and the only one
+recognised today, but secondary limits are signalled with `403` at some APIs
+and `503` means the same thing under overload. Branch on the sentinel; read
+the status only when the particular code matters to you.
 
 With `WithFailClose`, failures are returned as errors wrapping package
 sentinels — match them with `errors.Is`:
@@ -271,6 +318,19 @@ Log levels encode who has to act:
 | --- | --- |
 | `ERROR` | 401/403 and other 4xx — broken integration, needs a human. |
 | `WARN` | Timeouts, connection failures, 429, 5xx, malformed responses. |
+
+When the breaker trips it logs one `WARN` line naming why and for how long:
+
+```json
+{"msg":"leakcheck: circuit opened, skipping checks","cause":"skipped_rate_limited","cooldown":"1s"}
+```
+
+`cause` uses the same vocabulary as `Outcome.String()`, so it groups against
+the metric you are already emitting. It is logged at the trip rather than added
+to `Outcome`, because every short-circuited call that follows reports
+`skipped_circuit_open` regardless — the distinction between "we hit our own
+quota" and "the API is down" belongs to the state transition, not to each of
+the thousand calls it skips.
 
 A successful check logs nothing. Clients are safe for concurrent use; create
 one and reuse it so connections are pooled.

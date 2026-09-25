@@ -251,15 +251,15 @@ func TestBreakerCancelledProbeDoesNotWedge(t *testing.T) {
 func TestBreakerStragglerSuccessKeepsCircuitOpen(t *testing.T) {
 	b := &breaker{threshold: 2, cooldown: time.Minute}
 
-	b.failure()
-	b.failure()
-	if b.allow() {
+	_, _ = b.failure(ErrServerError)
+	_, _ = b.failure(ErrServerError)
+	if allowed, _ := b.allow(); allowed {
 		t.Fatal("circuit did not open at the threshold")
 	}
 
 	b.success()
 
-	if b.allow() {
+	if allowed, _ := b.allow(); allowed {
 		t.Error("a late success from before the trip reopened the circuit")
 	}
 }
@@ -271,19 +271,19 @@ func TestBreakerStragglerFailureDoesNotExtendCooldown(t *testing.T) {
 	now := time.Now()
 	b := &breaker{threshold: 2, cooldown: time.Minute, now: func() time.Time { return now }}
 
-	b.failure()
-	b.failure()
+	_, _ = b.failure(ErrServerError)
+	_, _ = b.failure(ErrServerError)
 	openedAt := b.openedAt
 
 	now = now.Add(30 * time.Second)
-	b.failure() // the straggler
+	b.failure(ErrServerError) // the straggler
 
 	if !b.openedAt.Equal(openedAt) {
 		t.Errorf("openedAt moved from %v to %v", openedAt, b.openedAt)
 	}
 
 	now = now.Add(31 * time.Second) // 61s after the trip, cooldown is 60s
-	if !b.allow() {
+	if allowed, _ := b.allow(); !allowed {
 		t.Error("cooldown did not elapse — a late failure pushed it forward")
 	}
 }
